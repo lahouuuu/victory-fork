@@ -99,3 +99,72 @@ CLAUDE.md, rule #1).
 - Suggested next task: Session 2, merge the 47 upstream commits, then measure the first
   room again with a warm cache (a second visit) with the same switch set, and with the run
   279 set.
+
+## Session 2 — upstream integrated (squashed, without diagnostics/); measurements not reached (2026-11-26)
+- Branch / start commit / end commit: main / 57e685d / bc5db4c (upstream) + the commit that
+  adds this entry. Nothing pushed.
+- Task given: bring in upstream/main, run the checks, build, then measure the first room with
+  a warm cache: A = run 253 set, B = run 279 set, C = the better of the two + Series S profile.
+- What was done (files, switches added):
+  - At start upstream/main had 66 commits we did not have (988aa41), not 47 (fc63ce1) as the
+    prompt said; the user chose all 66.
+  - A first `git merge` (542c10c, local only) was undone with `git reset --keep 57e685d`:
+    the run logs it brought under diagnostics/ (22 files) hold the title's internal file and
+    folder names (about 57 lines a log) and, in 10 of them, a personal online identifier of
+    upstream's tester. That fails rule #1 although `cargo xtask policy` passed. A real merge
+    would put them in our history even if deleted afterwards.
+  - PM decision (option 1): `git merge --squash 988aa41`, all of diagnostics/ removed from the
+    index and the folder (its README.md too), one commit bc5db4c "Upstream up to 988aa41,
+    squashed, without diagnostics/". `git ls-files diagnostics` is empty; main's history holds
+    no upstream commit; the tree equals upstream/main apart from diagnostics/ and our 4 .md.
+  - Upstream's changes to docs/asset-policy.md ("Run logs") and xtask/src/policy.rs that allow
+    diagnostics/ are kept as they are (simpler future integrations).
+  - No code of ours changed, no switch added.
+- Tests (57e685d before -> bc5db4c after):
+  - fmt: FAIL 1,476 diffs / 69 files -> FAIL 1,688 diffs / 73 files (upstream does not run fmt).
+  - clippy: FAIL 8 errors -> PASS (fixed upstream in 97f8dbc).
+  - clippy all-features: FAIL 10 errors -> PASS.
+  - test: 2 flaky WARP tests -> 611 passed, 0 failed, 13 ignored, on two runs in a row.
+  - policy: pass -> pass (190 files).
+  - `cargo build --release -p victory`: OK.
+- Switch sets:
+  - A (run 253): `VICTORY_LEVELS_ON_DEMAND=1 VICTORY_ASYNC_SUBMIT=1 VICTORY_QUEUE2=1
+    VICTORY_INDIRECT_WINDOW=1 VICTORY_TEXTURE_NO_WAIT=1 VICTORY_MERGE_GAP=64
+    VICTORY_MERGE_RUNS=4096 VICTORY_STAGING_POOL=0 VICTORY_COPY_PLAIN=1 VICTORY_JOIN_PARTS=1
+    VICTORY_BACK_OWN_VIEW=1 VICTORY_INDIRECT_GATHER=1 VICTORY_CARD_REHASH_RUNS=1`
+  - B (run 279, read from upstream's diagnostics/README.md at 988aa41, read only): A plus
+    `VICTORY_CARD_WINDOWS_MB=2048 VICTORY_CARD_BUFFERS_MIN_KB=64 VICTORY_CARD_BUFFERS_MB=1280
+    VICTORY_TEXTURE_BACK=1 VICTORY_CARD_HASH_LEN=1` (TEXTURE_BACK = the water fix: present).
+- Measurements: none of A, B or C was taken. Four warm-up launches with set A, none reached the
+  first room (the merge changes the shader translator, and Session 1 had never warmed the room):
+  1. After a fresh boot, other apps closed: opening cutscene 0 to 23 fps (mean 5.3 over 261
+     samples), then about 10 min on a still screen (2 draws a frame, 30 fps) while the PC was
+     left alone and possibly slept; closed normally, no crash.
+  2. Ended by itself 16 s after start, while booting: no line in crashes.log, no Windows
+     event, the layer's log stops mid-load with no error. Cause not known.
+  3. The game loaded the last save by itself; about 15 min at 30 fps on a near-empty screen
+     (10 to 13 draws), then crashed at the end of loading, 1,019 s after start: unhandled
+     exception 0xc0000005, write to address 0 in the title's own code, the same place and
+     stack as Session 1's second launch. Peaks: process 18 GB, system 39.9 / 57.9 GB, free RAM
+     near 0, GPU 7.1 GB. Not error 1455.
+  4. White screen at 30 fps for several minutes (the window caption lost its frame counter),
+     then loading; ended at 805 s by a normal close ("did not finish suspending in time"),
+     not a crash. Peaks: process 20.3 GB, system 42.0 / 57.9 GB, free RAM near 0, GPU 7.9 GB.
+  Side by side with Session 1 (run 3, set A, before the merge): cutscene 4.4 fps mean there,
+  5.3 here in launch 1; first room about 1 fps on a first visit there, not reached here.
+- Recommended command: none measured. Set A stays the one used, unproven better or worse than B.
+- What did NOT work or was taken back out: the real merge 542c10c (above).
+- Open problems found (not fixed):
+  - The load of the last save crashes in the title's own code (0xc0000005, write to 0): now 2
+    of the 3 launches that loaded a save directly. Free RAM is near 0 each time on this 16 GB
+    PC; memory pressure is a possible cause, not proven.
+  - A silent exit 16 s after start with nothing logged.
+  - The README (from upstream) points to diagnostics/README.md for the run 279 set and to run
+    logs; that folder does not exist here.
+  - diagnostics/ is left out here by PM decision, while docs/asset-policy.md and
+    xtask/src/policy.rs (from upstream) allow it: a future integration must keep leaving it out.
+  - fmt still fails (1,688 diffs).
+- Questions for the user / PM: whether to keep trying to reach the room on main (each try is
+  15 to 20 min and may crash at the save load) before comparing other bases.
+- Suggested next task: measure A and B in the first room once a launch gets there (start a new
+  game instead of loading the save, if the save load keeps crashing); then C (Series S).

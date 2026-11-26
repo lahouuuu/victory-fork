@@ -16,6 +16,8 @@
 //! `present` (swap chain).
 
 #[cfg(all(windows, feature = "diagnostics"))]
+mod backreads;
+#[cfg(all(windows, feature = "diagnostics"))]
 mod capture;
 #[cfg(windows)]
 mod cardmeter;
@@ -39,6 +41,8 @@ mod draw;
 pub mod dxgi;
 pub mod fence;
 pub mod frame;
+#[cfg_attr(not(windows), allow(dead_code))]
+mod heap_pass;
 #[cfg(windows)]
 pub mod framelog;
 #[cfg(windows)]
@@ -77,6 +81,8 @@ pub mod signature;
 mod texture;
 #[cfg(windows)]
 mod watch;
+#[cfg(windows)]
+mod texback;
 
 #[cfg(windows)]
 pub use host::on_failure;
@@ -84,6 +90,6 @@ pub use host::on_failure;
 pub use inplace::{title_memory_freeing, title_memory_section, title_memory_view};
 #[cfg(windows)]
 pub use watch::{
-    title_memory_reading, title_memory_remapped, title_memory_remapping, title_memory_written,
+    title_memory_committed, title_memory_reading, title_memory_remapped, title_memory_remapping, title_memory_written,
     writing as kernel_will_write,
 };

@@ -79,6 +79,26 @@ static RETIRED: Mutex<Vec<(u64, Retired)>> = Mutex::new(Vec::new());
 static STARTED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static FINISHED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// Microseconds of a submission's preparing by part, since the frame-rate
+/// line last took them: the asking and the look under flights, the lists'
+/// steps, the flush of refreshes, the snapshots and the wait for card
+/// results, `card_before`, the hand-over to the card. An instrument: the
+/// frame line's "preparing" had 19 to 23 ms a frame no line split (run 282).
+static PREP_PARTS: [std::sync::atomic::AtomicU64; 6] = [const { std::sync::atomic::AtomicU64::new(0) }; 6];
+
+/// Adds the time since `since` to part `i` of [`PREP_PARTS`]; now.
+fn prep_part(i: usize, since: std::time::Instant) -> std::time::Instant {
+    let now = std::time::Instant::now();
+    PREP_PARTS[i].fetch_add((now - since).as_micros() as u64, Ordering::Relaxed);
+    now
+}
+
+/// Submissions started and not finished yet: lists the card may still be
+/// running, which read the view heap's slots as they run.
+pub(crate) fn submissions_in_flight() -> u64 {
+    STARTED.load(Ordering::Relaxed).saturating_sub(FINISHED.load(Ordering::Relaxed))
+}
+
 /// A retired object, dropped on whatever thread finishes the submission.
 struct Retired(#[allow(dead_code)] Box<dyn std::any::Any>);
 // SAFETY: what is retired is D3D12 objects (free-threaded) and the
@@ -336,15 +356,181 @@ pub(crate) fn removal_context() -> String {
     text
 }
 
+/// The card's memory at every look since [`video_memory_line`] last took
+/// them: the most of the card's own in use, the least its budget was, the
+/// most of the PC's shared memory in use, and the looks. A look is every
+/// asking of [`Host::video_memory`] (the texture queue's, the card copies')
+/// and one of our own at most every tenth of a second
+/// ([`Host::video_memory_look`]). The memory line is one look in five
+/// seconds: what the card held between two of them was not known (runs 277
+/// and 279 lost the device at 90 and 92 hundredths of the budget by it).
+static VIDEO_PEAK: [std::sync::atomic::AtomicU64; 4] = [
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(u64::MAX),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+];
+
+/// [`memory_counts`] as they were when [`video_memory_line`] was last said,
+/// and when that was ([`now_ms`]).
+static MEMORY_MARK: [std::sync::atomic::AtomicU64; 7] = [const { std::sync::atomic::AtomicU64::new(0) }; 7];
+
+/// Running totals for [`video_memory_line`] and [`removal_memory`]: the
+/// bytes of upload, shared and card buffers made since the start
+/// ([`MADE`]), the bytes of host textures alive, the bytes of host copies
+/// of textures let go since the start, and host copies of textures made
+/// since the start.
+fn memory_counts() -> [u64; 6] {
+    [
+        MADE[1].load(Ordering::Relaxed),
+        MADE[3].load(Ordering::Relaxed),
+        MADE[5].load(Ordering::Relaxed),
+        crate::resource::HOST_TEXTURES[1].load(Ordering::Relaxed),
+        crate::resource::KINDS[3].load(Ordering::Relaxed),
+        crate::resource::KINDS[6].load(Ordering::Relaxed),
+    ]
+}
+
+/// With the frame-rate line, about once a second: what the looks at the
+/// card's memory saw since the last such line ([`VIDEO_PEAK`], taken), and
+/// what was made in that time ([`memory_counts`], noted for the next line
+/// and for a removal). `VICTORY_VIDEO_LOOK=0`: no line.
+fn video_memory_line() {
+    if !video_look_on() {
+        return;
+    }
+    let most = VIDEO_PEAK[0].swap(0, Ordering::Relaxed);
+    let least = VIDEO_PEAK[1].swap(u64::MAX, Ordering::Relaxed);
+    let shared = VIDEO_PEAK[2].swap(0, Ordering::Relaxed);
+    let looks = VIDEO_PEAK[3].swap(0, Ordering::Relaxed);
+    let now = memory_counts();
+    let then = [0, 1, 2, 3, 4, 5].map(|i| MEMORY_MARK[i].swap(now[i], Ordering::Relaxed));
+    let at = now_ms();
+    let before = MEMORY_MARK[6].swap(at, Ordering::Relaxed);
+    if looks == 0 {
+        return;
+    }
+    tracing::info!(
+        "video memory in the {} ms since the last such line, at {looks} looks: the card's own in use at most {} MB, its budget at least {} MB, \
+         the PC's shared in use at most {} MB; made in that time: upload buffers {} MB, shared buffers {} MB, card buffers {} MB, \
+         {} host copies of textures; host textures alive {} MB (then {} MB), {} MB of filled ones let go",
+        at.saturating_sub(before),
+        most >> 20,
+        least >> 20,
+        shared >> 20,
+        now[0].saturating_sub(then[0]) >> 20,
+        now[1].saturating_sub(then[1]) >> 20,
+        now[2].saturating_sub(then[2]) >> 20,
+        now[5].saturating_sub(then[5]),
+        now[3] >> 20,
+        then[3] >> 20,
+        now[4].saturating_sub(then[4]) >> 20,
+    );
+}
+
+/// Whether the card's memory is looked at between the memory lines
+/// (`VICTORY_VIDEO_LOOK=0`: not; on by default).
+fn video_look_on() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_VIDEO_LOOK").is_none_or(|v| v != "0"))
+}
+
+/// The memory side of a removal, for [`log_removal_context`]: the process's
+/// and the PC's memory at this moment, what the looks at the card's memory
+/// saw since the last [`video_memory_line`] ([`VIDEO_PEAK`], not taken),
+/// and what was made since that line. Atomics and two plain questions to
+/// the system: no lock of ours.
+fn removal_memory() -> String {
+    use windows_sys::Win32::System::ProcessStatus::{
+        K32GetPerformanceInfo, K32GetProcessMemoryInfo, PERFORMANCE_INFORMATION, PROCESS_MEMORY_COUNTERS,
+    };
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    // SAFETY: plain data the call fills in.
+    let mut c: PROCESS_MEMORY_COUNTERS = unsafe { std::mem::zeroed() };
+    c.cb = size_of::<PROCESS_MEMORY_COUNTERS>() as u32;
+    // SAFETY: our own process and a sized structure.
+    unsafe { K32GetProcessMemoryInfo(GetCurrentProcess(), &mut c, c.cb) };
+    // SAFETY: plain data the call fills in.
+    let mut p: PERFORMANCE_INFORMATION = unsafe { std::mem::zeroed() };
+    p.cb = size_of::<PERFORMANCE_INFORMATION>() as u32;
+    // SAFETY: a sized structure.
+    unsafe { K32GetPerformanceInfo(&mut p, p.cb) };
+    // The system counts in pages.
+    let pages = |n: usize| (n as u64 * p.PageSize as u64) >> 20;
+    let peak = [0, 1, 2, 3].map(|i| VIDEO_PEAK[i].load(Ordering::Relaxed));
+    let then = [0, 1, 2, 3, 4, 5, 6].map(|i| MEMORY_MARK[i].load(Ordering::Relaxed));
+    let now = memory_counts();
+    format!(
+        "the process: {} MB private (at most {} MB), {} MB of it in memory (at most {} MB); the PC: {} MB free of {} MB, {} MB committed of a limit of {} MB \
+         (at most {} MB), the kernel's own {} MB paged and {} MB not paged, {} handles; the card's memory at the {} looks since the last line of it: \
+         in use at most {} MB, the budget at least {} MB, the PC's shared in use at most {} MB; made in the {} ms since that line: upload buffers {} MB, \
+         shared buffers {} MB, card buffers {} MB, {} host copies of textures; host textures alive {} MB (then {} MB), {} MB of filled ones let go",
+        c.PagefileUsage as u64 >> 20,
+        c.PeakPagefileUsage as u64 >> 20,
+        c.WorkingSetSize as u64 >> 20,
+        c.PeakWorkingSetSize as u64 >> 20,
+        pages(p.PhysicalAvailable),
+        pages(p.PhysicalTotal),
+        pages(p.CommitTotal),
+        pages(p.CommitLimit),
+        pages(p.CommitPeak),
+        pages(p.KernelPaged),
+        pages(p.KernelNonpaged),
+        p.HandleCount,
+        peak[3],
+        peak[0] >> 20,
+        if peak[1] == u64::MAX { 0 } else { peak[1] >> 20 },
+        peak[2] >> 20,
+        now_ms().saturating_sub(then[6]),
+        now[0].saturating_sub(then[0]) >> 20,
+        now[1].saturating_sub(then[1]) >> 20,
+        now[2].saturating_sub(then[2]) >> 20,
+        now[5].saturating_sub(then[5]),
+        now[3] >> 20,
+        then[3] >> 20,
+        now[4].saturating_sub(then[4]) >> 20,
+    )
+}
+
 /// Says [`removal_context`] in the log, once: called by whoever finds the
 /// host device removed.
 pub(crate) fn log_removal_context() {
     static SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-    if !trail_on() || SAID.swap(true, Ordering::Relaxed) {
+    if !(trail_on() || dred_any()) || SAID.swap(true, Ordering::Relaxed) {
         return;
     }
-    tracing::error!("when the host device went: {}", removal_context());
+    if trail_on() {
+        tracing::error!("when the host device went: {}", removal_context());
+    }
+    // The memory at this moment: the memory line is up to five seconds
+    // old, and a card or a PC out of memory would not be in it.
+    tracing::error!("memory when the host device went: {}", removal_memory());
+    if let Some(host) = host() {
+        match host.video_memory_groups() {
+            Some(_) => host.log_video_memory("where the removal was found"),
+            None => tracing::error!("video memory where the removal was found: the system gives no numbers (the adapter does not answer)"),
+        }
+    }
+    // With device-removed data on (any form of `VICTORY_D3D12_DRED`): the
+    // runtime's data too, unless a submission's own report has just asked
+    // for it. Such a report came only from the three places that wait for
+    // a submission; a removal found anywhere else (a view being made, a
+    // tile mapped) printed none of it. Without the lookups in our own
+    // tables: whoever calls may hold their locks.
+    if dred_any()
+        && !DATA_SAID.load(Ordering::Relaxed)
+        && let Some(host) = host()
+    {
+        tracing::error!(
+            "device-removed data, asked where the removal was found{}",
+            host.removal_data_of(&[], false)
+        );
+    }
 }
+
+/// Whether [`Host::removal_data`] was asked for (once is enough for
+/// [`log_removal_context`]).
+static DATA_SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Time spent in submissions since the last frame-rate line, in
 /// microseconds: preparing them on the CPU (title memory copies, texture
@@ -629,13 +815,24 @@ fn create() -> windows::core::Result<Host> {
         }
         // Diagnostics: device-removed data (the command that faulted, the
         // faulting address), read when the device is removed.
-        if dred_on() {
+        if dred_any() {
+            let mode = dred_mode();
             let mut dred: Option<ID3D12DeviceRemovedExtendedDataSettings> = None;
             if D3D12GetDebugInterface(&mut dred).is_ok()
                 && let Some(dred) = dred
             {
-                dred.SetAutoBreadcrumbsEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
+                // `faults`: no breadcrumbs (the runtime then adds nothing
+                // to the commands), only the faulting address.
+                if mode != Dred::Faults {
+                    dred.SetAutoBreadcrumbsEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
+                }
                 dred.SetPageFaultEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
+                tracing::info!("device-removed data on: {}", mode.text());
+            } else {
+                tracing::warn!(
+                    "device-removed data was asked for ({}) and the runtime gave no settings for it: none will be kept",
+                    mode.text()
+                );
             }
         }
         let mut device: Option<ID3D12Device> = None;
@@ -763,6 +960,89 @@ pub(crate) fn warp_adapter() -> windows::core::Result<IDXGIAdapter> {
 
 #[cfg(test)]
 mod tests {
+    /// Run once with VICTORY_CARD_SYNC_BATCH=0 and once with it set to 1.
+    #[test]
+    #[ignore = "requires a D3D12 adapter and the card hash pipeline; run alone"]
+    fn two_dirty_card_buffers_reach_readback_in_the_same_submission() {
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
+        };
+        const MEM_WRITE_WATCH: u32 = 0x20_0000;
+        const MIB: usize = 1 << 20;
+        const PIECE: usize = 64 << 10;
+        let host = super::host().expect("a D3D12 device");
+        assert!(host.card_ready(), "the card hash pipeline must be available");
+        // SAFETY: a private allocation held through the fenced submissions.
+        let allocation = unsafe {
+            VirtualAlloc(std::ptr::null(), 2 * MIB, MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH, PAGE_READWRITE)
+        };
+        assert!(!allocation.is_null());
+        let bases = [allocation as usize, allocation as usize + MIB];
+        let shadows = bases.map(|base| {
+            crate::shadow::register(base, base as u64, MIB as u64);
+            let copy = crate::shadow::find(base as u64, MIB as u64).unwrap();
+            assert!(copy.carded(), "both title buffers must have a card copy");
+            copy
+        });
+        let readback = host.read_back_buffer(16).unwrap();
+        let hash_readback = host.read_back_buffer(64).unwrap();
+        let mut previous = [0u128; 4];
+        for round in [0x11u32, 0x55] {
+            let list = host.new_list().unwrap();
+            let mut expected = [0u32; 4];
+            for (i, (shadow, &base)) in shadows.iter().zip(&bases).enumerate() {
+                for (j, offset) in [32, PIECE + 20].into_iter().enumerate() {
+                    let k = 2 * i + j;
+                    expected[k] = round * 0x0101_0101 + k as u32;
+                    // SAFETY: aligned dword in the private allocation.
+                    unsafe { ((base + offset) as *mut u32).write_volatile(expected[k]); }
+                    shadow.refresh(&list, (base + offset) as u64, 4);
+                    // Request the before-hash for each of the two distinct pieces.
+                    shadow.gpu_writes(&list, (base + offset) as u64, 4);
+                    // SAFETY: the readback and the copy outlive this fenced list.
+                    unsafe { list.list.CopyBufferRegion(&readback, (k * 4) as u64, &shadow.buffer, offset as u64, 4); }
+                }
+            }
+            list.close();
+            host.execute(&[&list]);
+            let mut mapped = std::ptr::null_mut();
+            // SAFETY: execute waited for all four writes, and the buffer holds 16 bytes.
+            let got = unsafe {
+                readback.Map(0, None, Some(&mut mapped)).unwrap();
+                let got = mapped.cast::<[u32; 4]>().read_unaligned();
+                readback.Unmap(0, None);
+                got
+            };
+            assert_eq!(got, expected, "both copied pieces of each buffer");
+            let hash_list = host.new_list().unwrap();
+            for (i, shadow) in shadows.iter().enumerate() {
+                let hashes = shadow.card_sides().unwrap().1.expect("before-hashes were made");
+                // SAFETY: two consecutive 16-byte piece hashes from each live buffer.
+                unsafe { hash_list.list.CopyBufferRegion(&hash_readback, (32 * i) as u64, &hashes, 0, 32); }
+            }
+            hash_list.close();
+            host.execute(&[&hash_list]);
+            // SAFETY: all 64 bytes of the readback were written and fenced.
+            let current = unsafe {
+                hash_readback.Map(0, None, Some(&mut mapped)).unwrap();
+                let words = mapped.cast::<[u128; 4]>().read_unaligned();
+                hash_readback.Unmap(0, None);
+                words
+            };
+            for (i, hash) in current.iter().enumerate() {
+                assert_ne!(*hash, previous[i], "piece {i} must be rehashed");
+                assert!(!current[..i].contains(hash), "each piece has different input");
+            }
+            previous = current;
+        }
+        for base in bases {
+            crate::shadow::unregister(base, base as u64);
+        }
+        drop(shadows);
+        // SAFETY: the lists completed and the copies were unregistered.
+        unsafe { VirtualFree(allocation, 0, MEM_RELEASE); }
+    }
+
     #[test]
     fn sparse_copies_preserve_islands_and_observe_remaps() {
         use windows_sys::Win32::System::Memory::*;
@@ -903,6 +1183,10 @@ struct Gather {
     /// gathered from here on (the ones gathered before are read before
     /// the list runs, which is before that).
     closed: bool,
+    /// With `crate::indirect::gather_by_copy`: the host copies (their
+    /// numbers) the list's shaders were declared to write so far
+    /// (`Shadow::gpu_writes`): no record of those is gathered from then on.
+    written: std::collections::HashSet<u64>,
     /// One set per argument buffer, kind and stride.
     sets: Vec<crate::indirect::GatherSet>,
     /// The budget words the gathered records are charged to.
@@ -1361,14 +1645,83 @@ fn record_twin_copy(
     }
 }
 
-/// Whether device-removed data is on (`VICTORY_D3D12_DRED`, diagnostics
+/// The forms of device-removed data (`VICTORY_D3D12_DRED`, diagnostics
 /// builds).
-pub(crate) fn dred_on() -> bool {
-    static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| {
-        cfg!(feature = "diagnostics") && std::env::var_os("VICTORY_D3D12_DRED").is_some()
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Dred {
+    /// Not set.
+    Off,
+    /// Any value but the two below (`1`): breadcrumbs, the faulting
+    /// address, and a marker with its text before every noted command.
+    Full,
+    /// `light`: breadcrumbs and the faulting address, no marker and no
+    /// text (which list a removed device stopped in, at which of its
+    /// commands, and the pipelines the list binds). The full form made a
+    /// frame's recording 2.4 times slower (run 277: 591 ms against 246);
+    /// how much of that the marker texts are is what this form measures.
+    Light,
+    /// `faults`: the faulting address only (no breadcrumbs, no marker, no
+    /// text), to stay on while the title is played.
+    Faults,
+}
+
+impl Dred {
+    /// For the log.
+    fn text(self) -> &'static str {
+        match self {
+            Dred::Off => "off",
+            Dred::Full => "full: breadcrumbs, page faults, a marker text per command",
+            Dred::Light => "light: breadcrumbs and page faults, no marker texts",
+            Dred::Faults => "faults: page faults only, no breadcrumbs",
+        }
+    }
+}
+
+/// The form of device-removed data asked for.
+pub(crate) fn dred_mode() -> Dred {
+    static MODE: OnceLock<Dred> = OnceLock::new();
+    *MODE.get_or_init(|| {
+        if !cfg!(feature = "diagnostics") {
+            return Dred::Off;
+        }
+        match std::env::var_os("VICTORY_D3D12_DRED") {
+            None => Dred::Off,
+            Some(v) if v == "light" => Dred::Light,
+            Some(v) if v == "faults" => Dred::Faults,
+            // Any other value, as before the two above were known.
+            Some(_) => Dred::Full,
+        }
     })
 }
+
+/// Whether device-removed data is on in its full form (`VICTORY_D3D12_DRED`
+/// set to anything but `light` or `faults`, diagnostics builds): the one
+/// in which every noted command gets a marker and a text
+/// (`HostList::note_op`).
+pub(crate) fn dred_on() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| dred_mode() == Dred::Full)
+}
+
+/// Whether device-removed data is on in any form ([`Dred`]).
+pub(crate) fn dred_any() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| dred_mode() != Dred::Off)
+}
+
+/// Whether objects made while frames are drawn are named too
+/// ([`name_frame`]): always in the full form (as before); in `light` and
+/// `faults` unless `VICTORY_D3D12_DRED_FRAME_NAMES=0`.
+fn frame_names() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        dred_on() || (dred_any() && std::env::var_os("VICTORY_D3D12_DRED_FRAME_NAMES").is_none_or(|v| v != "0"))
+    })
+}
+
+/// Host objects named since the start ([`name`]), and those of them made
+/// while frames are drawn ([`name_frame`]): each is one `SetName` call.
+static NAMED: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
 
 /// Indirect mesh dispatches since the last frame line: the largest group
 /// count a record asked for, and the groups asked in all (from the lists'
@@ -1395,13 +1748,36 @@ fn timing() -> bool {
 }
 
 /// Names a host object for the device-removed report, which names the
-/// allocations a page fault hit (only with device-removed data on).
+/// allocations a page fault hit (only with device-removed data on, in any
+/// of its forms: the names are what a faulting address is read by).
 pub(crate) fn name(object: &impl Interface, text: impl FnOnce() -> String) {
-    if dred_on()
+    if dred_any()
         && let Ok(object) = object.cast::<ID3D12Object>()
     {
+        // Counted, so that a log says what naming costs: one text and one
+        // call each. Said at 4,096 and at every doubling after it.
+        let named = NAMED[0].fetch_add(1, Ordering::Relaxed) + 1;
+        if named >= 4096 && named.is_power_of_two() {
+            tracing::info!(
+                "device-removed data: {named} host objects named so far, {} of them made while frames are drawn",
+                NAMED[1].load(Ordering::Relaxed)
+            );
+        }
         // SAFETY: a plain call on a live object.
         let _ = unsafe { object.SetName(&windows::core::HSTRING::from(text())) };
+    }
+}
+
+/// As [`name`], for an object made while frames are drawn (a list's upload
+/// buffer, a texture upload's staging buffer, a read-back buffer: hundreds
+/// a second): those are the freed allocations a faulting address is most
+/// likely to be found in, so they are named in every form, and
+/// `VICTORY_D3D12_DRED_FRAME_NAMES=0` leaves them unnamed in `light` and
+/// `faults` ([`frame_names`]).
+pub(crate) fn name_frame(object: &impl Interface, text: impl FnOnce() -> String) {
+    if frame_names() {
+        NAMED[1].fetch_add(1, Ordering::Relaxed);
+        name(object, text);
     }
 }
 
@@ -1686,6 +2062,100 @@ void main(uint3 id : SV_DispatchThreadID) {
 }
 "#;
 
+/// [`CARD_COMPARE`] with a group of 64 threads to a piece
+/// (`VICTORY_CARD_HASH_WIDE=1`; the thread a piece unless asked). After fork
+/// pull request #1014 by martindevbr.
+///
+/// With a thread a piece, a pass hashes its 64 KiB pieces in 4,096 steps
+/// one after the other, and its time is that of one piece however few
+/// pieces it has: the card waits on one load at a time and runs next to
+/// nothing else. The passes run before every submission's lists (hashes
+/// after ranges were sent up, 300 to 450 a frame) and after them (compares,
+/// about 100). Measured on an RTX 3060 in the first rooms with the frame
+/// rate switches on: the card was 85 % busy, and "our send-and-hash lists"
+/// were 23 to 29 ms of its frame.
+///
+/// Here thread `t` of a piece's group hashes the 16-byte steps `t`, `t +
+/// 64`, `t + 128`... of the piece (neighbouring threads read neighbouring
+/// bytes), and the first thread folds the 64 lane hashes in lane order into
+/// the piece's hash. It is another hash than [`CARD_COMPARE`]'s, so one
+/// process uses one of them for every hash it stores and compares (it is
+/// chosen once). Copies are under 1 GiB (`shadow::card_for`): at most
+/// 16,385 pieces, one group each, within a dispatch's 65,535.
+pub(crate) const CARD_COMPARE_WIDE: &str = r#"
+#define RS "RootConstants(num32BitConstants=6, b0), SRV(t0), UAV(u0), UAV(u1)"
+cbuffer Span : register(b0) {
+    uint first;    // the first piece
+    uint skew;     // where the copy starts in its piece 0
+    uint size;     // the copy's buffer, in bytes (a multiple of 64 KiB)
+    uint pieces;
+    uint out_at;   // the first piece's dword in `differs`, in bytes
+    uint compare;  // 0: the hashes are stored; else compared with those stored (2: and then stored)
+};
+ByteAddressBuffer now : register(t0);
+RWByteAddressBuffer hashes : register(u0);
+RWByteAddressBuffer differs : register(u1);
+groupshared uint4 lanes[64];
+[RootSignature(RS)]
+[numthreads(64, 1, 1)]
+void main(uint3 group : SV_GroupID, uint t : SV_GroupIndex) {
+    uint i = group.x;
+    if (i >= pieces) return;
+    uint piece = first + i;
+    uint lo = piece * 65536u;
+    lo = lo > skew ? lo - skew : 0u;
+    uint hi = min((piece + 1u) * 65536u - skew, size);
+    lo = lo & ~15u;
+    hi = (hi + 15u) & ~15u;
+    uint4 h = uint4(0x9E3779B9u, 0x85EBCA6Bu, 0xC2B2AE35u, 0x27D4EB2Fu) ^ t;
+    [loop]
+    for (uint at = lo + t * 16u; at < hi; at += 1024u) {
+        h = (h ^ now.Load4(at)) * uint4(0x01000193u, 0x9E3779B1u, 0x85EBCA77u, 0xC2B2AE3Du);
+        h = h.yzwx ^ (h >> 15);
+    }
+    lanes[t] = h;
+    GroupMemoryBarrierWithGroupSync();
+    if (t != 0u) return;
+    uint4 all = uint4(0x27D4EB2Fu, 0x165667B1u, 0xD3A2646Cu, 0xFD7046C5u);
+    [loop]
+    for (uint k = 0u; k < 64u; k++) {
+        all = (all ^ lanes[k]) * uint4(0x01000193u, 0x9E3779B1u, 0x85EBCA77u, 0xC2B2AE3Du);
+        all = all.yzwx ^ (all >> 15);
+    }
+    if (compare != 0u) {
+        differs.Store(out_at + i * 4u, any(all != hashes.Load4(piece * 16u)) ? 1u : 0u);
+        if (compare == 2u) hashes.Store4(piece * 16u, all);
+    } else {
+        hashes.Store4(piece * 16u, all);
+    }
+}
+"#;
+
+/// Whether [`CARD_COMPARE_WIDE`] is the compare (`VICTORY_CARD_HASH_WIDE=1`;
+/// off unless asked: it has not run in a game on this tree yet, and it is
+/// another hash with another rare pattern of changes it cannot see). Chosen
+/// once and said in the log: stored and compared hashes must agree.
+pub(crate) fn card_hash_wide() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var_os("VICTORY_CARD_HASH_WIDE").is_some_and(|v| v == "1");
+        if on {
+            tracing::info!("the card's hashes of copies' pieces are made by a group of 64 threads a piece (VICTORY_CARD_HASH_WIDE=1)");
+        }
+        on
+    })
+}
+
+/// The compare's source for this process ([`card_hash_wide`]).
+pub(crate) fn card_compare_source() -> &'static str {
+    if card_hash_wide() { CARD_COMPARE_WIDE } else { CARD_COMPARE }
+}
+
+/// The groups a compare pass over `pieces` pieces is dispatched with.
+pub(crate) fn card_compare_groups(pieces: u32) -> u32 {
+    if card_hash_wide() { pieces } else { pieces.div_ceil(64) }
+}
+
 /// Whether the pieces a flight's compare flags come down to the PC inside
 /// the flight itself (`VICTORY_CARD_FETCH_INFLIGHT=1`; off by default, and
 /// only with [`relay`]).
@@ -1960,8 +2430,18 @@ struct Deferred {
     /// Buffer ranges refreshed since the last title copy (host copy,
     /// address, bytes): refreshing them again would find the same bytes.
     refreshed: std::collections::HashSet<(usize, usize, usize)>,
+    /// With [`list_reuse`]: the host pipelines the list has kept, by
+    /// address ([`HostList::first_bind`]).
+    bound: std::collections::HashSet<usize>,
+    /// With [`list_reuse`]: upload memory filled from title memory since
+    /// the last title copy (source, bytes): its host GPU address, which a
+    /// second fill would find holding the same bytes
+    /// ([`HostList::fill_scratch`]).
+    filled: std::collections::HashMap<(usize, usize), u64>,
     /// Textures whose contents the list brings up to date.
     textures: std::collections::HashSet<usize>,
+    /// Last GPU source copied into each aliased host texture in this list.
+    texture_aliases: std::collections::HashMap<usize, usize>,
     /// Bottom-of-pipe writes, done once the list has run: address, what,
     /// bytes.
     writes: Vec<(usize, crate::queue::Written, usize)>,
@@ -1970,6 +2450,11 @@ struct Deferred {
     /// memory they go to, the bytes of a row, the rows, the title's row
     /// pitch.
     backs: Vec<(ID3D12Resource, usize, [usize; 3])>,
+    /// Title textures of the kinds copied back ([`crate::texback`]) that
+    /// the list's shaders write, copied when the list closes.
+    back_wanted: Vec<crate::texback::Target>,
+    /// Those copies, whose texels go to title memory once the list has run.
+    texture_backs: Vec<crate::texback::Back>,
     /// Whether the indirect-work budget is zeroed for this recording (a
     /// step on the CPU, or in the list for the card's copy).
     budget_zeroed: bool,
@@ -2452,6 +2937,8 @@ struct Sent {
     number: u64,
     card: Option<CardPlan>,
     back: Vec<Declared>,
+    /// Title-memory ranges written when its shader textures are copied back.
+    texture_back_ranges: Vec<(usize, usize)>,
     /// Its bottom-of-pipe writes.
     writes: Vec<(usize, crate::queue::Written, usize)>,
 }
@@ -2467,6 +2954,7 @@ struct Flight {
     order: Vec<usize>,
     card: Option<CardPlan>,
     back: Vec<Declared>,
+    texture_back_ranges: Vec<(usize, usize)>,
 }
 
 /// One thing in the line of what waits for the card, in order.
@@ -2480,8 +2968,8 @@ enum Late {
 
 struct Line {
     line: Vec<Late>,
-    /// The title memory the flights' shaders may write (address, end), in
-    /// order and joined.
+    /// The title memory the flights' shaders and texture readbacks may write
+    /// (address, end), in order and joined.
     written: Vec<(usize, usize)>,
     /// Host lists in the flights.
     lists: usize,
@@ -3024,6 +3512,135 @@ mod fill_check {
     }
 }
 
+/// Whether a submission's passes over its lists' steps find a step's copy
+/// by an index instead of a search (`VICTORY_STEP_INDEX=1`; off by default;
+/// `alt`: twenty seconds with, twenty without, in turn, each change said in
+/// the log). The same copies, ranges and order come out
+/// ([`declared_by_index`], [`stale_under_flights`]); what goes is a lock
+/// and a search of a list per refresh step and a search of two lists per
+/// range given to shaders.
+fn step_index() -> bool {
+    /// 0 off, 1 on, 2 in turn.
+    static MODE: OnceLock<u8> = OnceLock::new();
+    match *MODE.get_or_init(|| match std::env::var("VICTORY_STEP_INDEX").as_deref() {
+        Ok("1") => 1,
+        Ok("alt") => 2,
+        _ => 0,
+    }) {
+        0 => false,
+        1 => true,
+        _ => {
+            static EPOCH: OnceLock<std::time::Instant> = OnceLock::new();
+            let on = (EPOCH.get_or_init(std::time::Instant::now).elapsed().as_secs() / 20) % 2 == 1;
+            static LAST: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(2);
+            if LAST.swap(u8::from(on), Ordering::Relaxed) != u8::from(on) {
+                tracing::info!(
+                    "a submission's steps find their copy by an index from now (VICTORY_STEP_INDEX=alt): {}",
+                    if on { "ON" } else { "off, by a search as usual" }
+                );
+            }
+            on
+        }
+    }
+}
+
+/// The ranges (from, to) given to shaders, as `given` names them in order,
+/// per copy: the copies in the order they first come, each range once, in
+/// the order it first comes. What the search per step gives
+/// ([`declared_writes`], `Host::card_before`), found by an index.
+fn declared_by_index<'a>(
+    given: impl Iterator<Item = (&'a std::sync::Arc<crate::shadow::Shadow>, (usize, usize))>,
+) -> Vec<Declared> {
+    grouped(given.map(|(shadow, range)| (std::sync::Arc::as_ptr(shadow) as usize, shadow, range)))
+        .into_iter()
+        .map(|(shadow, ranges)| (shadow.clone(), ranges))
+        .collect()
+}
+
+/// `given` (a key, what the key stands for, a range) as one entry per key,
+/// in the order the keys first come, each with its ranges, every range
+/// once, in the order it first comes ([`declared_by_index`]).
+fn grouped<T>(given: impl Iterator<Item = (usize, T, (usize, usize))>) -> Vec<(T, Vec<(usize, usize)>)> {
+    let mut out: Vec<(T, Vec<(usize, usize)>)> = Vec::new();
+    let mut place: std::collections::HashMap<usize, usize> = std::collections::HashMap::new();
+    let mut seen: std::collections::HashSet<(usize, usize, usize)> = std::collections::HashSet::new();
+    for (key, of, range) in given {
+        if !seen.insert((key, range.0, range.1)) {
+            continue;
+        }
+        let at = *place.entry(key).or_insert_with(|| {
+            out.push((of, Vec::new()));
+            out.len() - 1
+        });
+        out[at].1.push(range);
+    }
+    out
+}
+
+#[cfg(test)]
+mod grouped_tests {
+    /// What the search per step gives (`declared_writes` without the
+    /// switch), for keys that stand for themselves.
+    fn searched(given: &[(usize, (usize, usize))]) -> Vec<(usize, Vec<(usize, usize)>)> {
+        let mut back: Vec<(usize, Vec<(usize, usize)>)> = Vec::new();
+        for &(key, range) in given {
+            match back.iter_mut().find(|(k, _)| *k == key) {
+                Some((_, ranges)) => {
+                    if !ranges.contains(&range) {
+                        ranges.push(range);
+                    }
+                }
+                None => back.push((key, vec![range])),
+            }
+        }
+        back
+    }
+
+    /// The index gives what the search gives: the same keys in the same
+    /// order, each with the same ranges in the same order, whatever comes
+    /// twice and however the keys take turns.
+    #[test]
+    fn the_index_gives_what_the_search_gives() {
+        let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = |below: usize| {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            (seed >> 33) as usize % below
+        };
+        assert!(super::grouped(std::iter::empty::<(usize, usize, (usize, usize))>()).is_empty());
+        for (keys, ranges, steps) in [(1, 1, 5), (3, 4, 200), (40, 6, 3000), (500, 50, 3000)] {
+            for _ in 0..20 {
+                let given: Vec<(usize, (usize, usize))> = (0..steps)
+                    .map(|_| {
+                        let from = next(ranges) * 64;
+                        (0x1000 + next(keys) * 8, (from, from + 16 + next(2) * 16))
+                    })
+                    .collect();
+                let by_index = super::grouped(given.iter().map(|&(key, range)| (key, key, range)));
+                assert_eq!(by_index, searched(&given), "{keys} keys, {ranges} ranges, {steps} steps");
+            }
+        }
+    }
+}
+
+/// The ranges of `runs`' steps that give memory to shaders, with the copy
+/// each is of; `carded`: only those of copies in the card's memory.
+fn given_to_shaders<'a>(
+    runs: &'a [&'a HostList],
+    carded: bool,
+) -> Vec<(std::sync::Arc<crate::shadow::Shadow>, (usize, usize))> {
+    let mut given = Vec::new();
+    for list in runs {
+        for step in &list.deferred().copies {
+            if let Step::GpuWrite(shadow, address, len) = step
+                && (!carded || shadow.carded())
+            {
+                given.push((shadow.clone(), (*address, *address + *len)));
+            }
+        }
+    }
+    given
+}
+
 /// With flights in the air, after the submission's write-watch asking:
 /// whether `runs` refresh a range of a host copy that a flight's shaders
 /// may write and that the title wrote since it was last copied. The
@@ -3034,14 +3651,50 @@ fn stale_under_flights(runs: &[&HostList]) -> bool {
     // Per copy, the span of what is refreshed (a flush brings that much
     // up to date at most).
     let mut spans: Vec<(Arc<crate::shadow::Shadow>, usize, usize)> = Vec::new();
-    for list in runs {
-        for step in &list.deferred().copies {
-            if let Step::Refresh(shadow, address, len) = step
-                && shadow.writes_pending()
-            {
-                match spans.iter_mut().find(|s| Arc::ptr_eq(&s.0, shadow)) {
-                    Some(s) => (s.1, s.2) = (s.1.min(*address), s.2.max(*address + *len)),
-                    None => spans.push((shadow.clone(), *address, *address + *len)),
+    if step_index() {
+        // By copy (its address): its place in `spans`, or that no shader's
+        // writes are pending on it. Asked once a copy, not once a step
+        // (20,000 to 43,000 refresh steps a frame, each a lock and a search
+        // of `spans`); steps of one copy mostly follow one another, so the
+        // last answer is tried first. Only this thread adds pending writes,
+        // after this; a landing may take a copy's away meanwhile, and then
+        // its span is as if the landing came before or after all its
+        // steps, and the merge below finds nothing pending.
+        let mut known: std::collections::HashMap<usize, Option<usize>> = std::collections::HashMap::new();
+        let mut last: (usize, Option<usize>) = (0, None);
+        for list in runs {
+            for step in &list.deferred().copies {
+                if let Step::Refresh(shadow, address, len) = step {
+                    let key = Arc::as_ptr(shadow) as usize;
+                    let at = if last.0 == key {
+                        last.1
+                    } else {
+                        let at = *known.entry(key).or_insert_with(|| {
+                            shadow.writes_pending().then(|| {
+                                spans.push((shadow.clone(), usize::MAX, 0));
+                                spans.len() - 1
+                            })
+                        });
+                        last = (key, at);
+                        at
+                    };
+                    if let Some(at) = at {
+                        let s = &mut spans[at];
+                        (s.1, s.2) = (s.1.min(*address), s.2.max(*address + *len));
+                    }
+                }
+            }
+        }
+    } else {
+        for list in runs {
+            for step in &list.deferred().copies {
+                if let Step::Refresh(shadow, address, len) = step
+                    && shadow.writes_pending()
+                {
+                    match spans.iter_mut().find(|s| Arc::ptr_eq(&s.0, shadow)) {
+                        Some(s) => (s.1, s.2) = (s.1.min(*address), s.2.max(*address + *len)),
+                        None => spans.push((shadow.clone(), *address, *address + *len)),
+                    }
                 }
             }
         }
@@ -3061,6 +3714,47 @@ fn stale_under_flights(runs: &[&HostList]) -> bool {
         return spans.iter().any(|(shadow, from, to)| shadow.merge_under_writes(*from, *to - *from, &mut runs_left));
     }
     spans.iter().any(|(shadow, from, to)| shadow.stale_under_writes(*from, *to - *from))
+}
+
+/// Whether the list that brings copies in the card's memory up to date
+/// records its work in three steps over all the copies: every changed
+/// range copied up, then every state change in one call, then every hash
+/// pass (`VICTORY_CARD_SYNC_BATCH=1`; fork pull request #1227, where it is
+/// on by default. Here: OFF unless set until a run of ours has carried it;
+/// `alt`: twenty seconds with, twenty without, in turn, each change said in
+/// the log).
+///
+/// Copy by copy, each with its copies, its state change and its hash
+/// passes, the card went from copying to compute and back for every copy
+/// of the list: about 300 times a frame with every title buffer's copy in
+/// the card's memory (`VICTORY_CARD_BUFFERS_MIN_KB=64`), where the
+/// send-and-hash lists took 24 to 28 ms of the card a frame for 28 MB sent
+/// up and 600 pieces hashed. The same work in three steps took 5.3 to 5.7.
+/// Nothing a hash pass reads is written by a later copy of the list: each
+/// copy's ranges and pieces are its own buffer's.
+fn sync_batched() -> bool {
+    /// 0 off, 1 on, 2 in turn.
+    static MODE: OnceLock<u8> = OnceLock::new();
+    match *MODE.get_or_init(|| match std::env::var("VICTORY_CARD_SYNC_BATCH").as_deref() {
+        Ok("1") => 1,
+        Ok("alt") => 2,
+        _ => 0,
+    }) {
+        0 => false,
+        1 => true,
+        _ => {
+            static EPOCH: OnceLock<std::time::Instant> = OnceLock::new();
+            let on = (EPOCH.get_or_init(std::time::Instant::now).elapsed().as_secs() / 20) % 2 == 1;
+            static LAST: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(2);
+            if LAST.swap(u8::from(on), Ordering::Relaxed) != u8::from(on) {
+                tracing::info!(
+                    "the send-and-hash list records its copies, one state change and its hash passes in three steps from now (VICTORY_CARD_SYNC_BATCH=alt): {}",
+                    if on { "ON" } else { "off, copy by copy as usual" }
+                );
+            }
+            on
+        }
+    }
 }
 
 /// A fence signal on a queue ([`late`]): goes behind the flights in the
@@ -3499,10 +4193,40 @@ fn late_line(frames: f64) {
     }
     if late_exact() {
         let [pages, runs, bytes] = crate::shadow::merged_stats().map(|n| n as f64 / frames);
+        let gave_up = crate::shadow::merge_gave_up();
         tracing::info!(
             "title bytes put in under flights' shader writes per frame (VICTORY_LATE_WAIT=2): {pages:.0} pages looked at, \
-             {runs:.0} changed runs, {:.2} MB",
-            bytes / (1 << 20) as f64
+             {runs:.0} changed runs, {:.2} MB; in these frames the merge gave up (the flights are then settled whole): {} times \
+             because the copy's memory is not watched, {} because the write tracking had no answer, {} for more changed runs than \
+             VICTORY_MERGE_RUNS leaves, {} for a copy in PC memory without its snapshot",
+            bytes / (1 << 20) as f64,
+            gave_up[0],
+            gave_up[1],
+            gave_up[2],
+            gave_up[3]
+        );
+    }
+    {
+        let found = [0, 1].map(|i| crate::shadow::LOOKUPS[i].swap(0, Ordering::Relaxed) as f64 / frames);
+        tracing::info!(
+            "asks for a buffer's host copy per frame: {:.0} answered from the asking thread's memory of them, {:.0} from the tables (VICTORY_LOOKUP_CACHE)",
+            found[0],
+            found[1]
+        );
+    }
+    {
+        let parts = [0, 1, 2, 3, 4, 5].map(|i| PREP_PARTS[i].swap(0, Ordering::Relaxed) as f64 / 1e3 / frames);
+        tracing::info!(
+            "a submission's preparing by part, ms per frame: the write-watch asking and the look for title bytes under flights \
+             (settles for them included) {:.1}; the lists' steps (title copies, fills, preludes; refreshes are only noted) {:.1}; \
+             the refreshes (the flush) {:.1}; snapshots and the wait for card results {:.1}; the card copies' send and hash lists \
+             (card_before) {:.1}; handing the lists to the card and signalling {:.1}",
+            parts[0],
+            parts[1],
+            parts[2],
+            parts[3],
+            parts[4],
+            parts[5]
         );
     }
 }
@@ -3604,7 +4328,12 @@ fn continues(last: (usize, usize, usize), next: (usize, usize, usize)) -> bool {
 /// One list's lock at a time: a submission may name a list twice.
 fn declared_writes(runs: &[&HostList]) -> Vec<Declared> {
     let mut back: Vec<Declared> = Vec::new();
-    for list in runs {
+    let indexed = step_index();
+    if indexed {
+        let given = given_to_shaders(runs, false);
+        back = declared_by_index(given.iter().map(|(shadow, range)| (shadow, *range)));
+    }
+    for list in if indexed { &[][..] } else { runs } {
         for step in &list.deferred().copies {
             if let Step::GpuWrite(shadow, address, len) = step {
                 let range = (*address, *address + *len);
@@ -3644,6 +4373,11 @@ pub(crate) fn walls_trace() -> bool {
 /// without it, so the title read a buffer nobody wrote, as before read-backs
 /// were made (the exposure metering's two small float targets, every frame).
 fn read_backs(list: &HostList) {
+    // Textures shaders wrote that the title reads on the CPU
+    // ([`crate::texback`]).
+    for back in &list.deferred().texture_backs {
+        crate::texback::land(back);
+    }
     for (buffer, at, [row, rows, pitch]) in &list.deferred().backs {
         let mut data = std::ptr::null_mut();
         // SAFETY: a read-back buffer of ours, written by the list that has
@@ -3956,9 +4690,10 @@ impl Host {
         // SAFETY: the source and names live through the call; the out
         // pointer is ours.
         unsafe {
+            let source = card_compare_source();
             D3DCompile(
-                CARD_COMPARE.as_ptr().cast(),
-                CARD_COMPARE.len(),
+                source.as_ptr().cast(),
+                source.len(),
                 windows::core::s!("card compare"),
                 None,
                 None,
@@ -4107,7 +4842,12 @@ impl Host {
         }
         // The ranges this submission's shaders may write, per copy.
         let mut declared: Vec<(Arc<crate::shadow::Shadow>, Vec<(usize, usize)>)> = Vec::new();
-        for list in runs {
+        let indexed = step_index();
+        if indexed {
+            let given = given_to_shaders(runs, true);
+            declared = declared_by_index(given.iter().map(|(shadow, range)| (shadow, *range)));
+        }
+        for list in if indexed { &[][..] } else { runs } {
             for step in &list.deferred().copies {
                 if let Step::GpuWrite(shadow, address, len) = step
                     && shadow.carded()
@@ -4232,6 +4972,61 @@ impl Host {
                     let shot_span = crate::shot::span_begin(list);
                     // Where the next range lies in the landing buffer.
                     let mut at = 0u64;
+                    // In three steps over all the copies ([`sync_batched`]):
+                    // every changed range copied up, then every state
+                    // change in one call, then every hash pass.
+                    struct Synced<'a> {
+                        shadow: &'a Arc<crate::shadow::Shadow>,
+                        ranges: &'a [(usize, usize)],
+                        before: Option<ID3D12Resource>,
+                        size: u64,
+                    }
+                    let batched = sync_batched();
+                    let mut synced: Vec<Synced> = Vec::with_capacity(dirty.len());
+                    // No twin (it cost the card the copy's size again, 399 MB
+                    // in run 75): `before` holds a 128-bit hash of each 64 KiB
+                    // piece. The pieces just sent up are hashed again, all of
+                    // them the first time; the compare after the lists hashes
+                    // the declared pieces and flags those whose hash is another.
+                    let hashes = |list: &ID3D12GraphicsCommandList, group: &[Synced]| {
+                        // (a copy promoted the buffer to a copy destination)
+                        let moves: Vec<_> = group
+                            .iter()
+                            .filter(|w| w.before.is_some() && !w.ranges.is_empty())
+                            .map(|w| transition(&w.shadow.buffer, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE))
+                            .collect();
+                        if !moves.is_empty() {
+                            list.ResourceBarrier(&moves);
+                        }
+                        let mut bound = false;
+                        for w in group {
+                            let Some(before) = &w.before else {
+                                continue;
+                            };
+                            if !bound {
+                                bound = true;
+                                list.SetComputeRootSignature(&work.root);
+                                list.SetPipelineState(&work.pso);
+                                list.SetComputeRootUnorderedAccessView(3, work.differs.0.GetGPUVirtualAddress());
+                            }
+                            list.SetComputeRootShaderResourceView(1, w.shadow.buffer.GetGPUVirtualAddress());
+                            list.SetComputeRootUnorderedAccessView(2, before.GetGPUVirtualAddress());
+                            let runs: Vec<crate::shadow::CardSpan> = if whole.iter().any(|s| Arc::ptr_eq(s, w.shadow)) {
+                                vec![w.shadow.card_run(0, usize::MAX)]
+                            } else {
+                                w.ranges.iter().map(|&(a, b)| w.shadow.card_run(a, b)).collect()
+                            };
+                            // The same pieces in fewer passes (`rehash_runs`).
+                            let runs = if rehash_runs() { crate::shadow::joined_piece_runs(runs) } else { runs };
+                            CARD_PASSES[0].fetch_add(runs.len() as u64, Ordering::Relaxed);
+                            CARD_PASSES[1].fetch_add(runs.iter().map(|r| u64::from(r.pieces)).sum::<u64>(), Ordering::Relaxed);
+                            for run in runs {
+                                let constants = [run.first, run.skew, w.shadow.card_hashed().unwrap_or(w.size) as u32, run.pieces, 0, 0];
+                                list.SetComputeRoot32BitConstants(0, 6, constants.as_ptr().cast(), 0);
+                                list.Dispatch(card_compare_groups(run.pieces), 1, 1);
+                            }
+                        }
+                    };
                     for (shadow, ranges) in &dirty {
                         let Some((staging, before, size)) = shadow.card_sides() else {
                             continue;
@@ -4245,41 +5040,14 @@ impl Host {
                             crate::shadow::CARD_STATS[0].fetch_add((b - a) as u64, Ordering::Relaxed);
                         }
                         crate::shadow::CARD_STATS[1].fetch_add(ranges.len() as u64, Ordering::Relaxed);
-                        let Some(before) = before else {
-                            continue;
-                        };
-                        // No twin (it cost the card the copy's size again,
-                        // 399 MB in run 75): `before` holds a 128-bit hash
-                        // of each 64 KiB piece. The pieces just sent up are
-                        // hashed again, all of them the first time; the
-                        // compare after the lists hashes the declared
-                        // pieces and flags those whose hash is another.
-                        if !ranges.is_empty() {
-                            list.ResourceBarrier(&[transition(
-                                &shadow.buffer,
-                                D3D12_RESOURCE_STATE_COPY_DEST,
-                                D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
-                            )]);
+                        synced.push(Synced { shadow, ranges, before, size });
+                        if !batched {
+                            // As before: this copy's hash passes behind its copies.
+                            hashes(list, &synced[synced.len() - 1..]);
                         }
-                        list.SetComputeRootSignature(&work.root);
-                        list.SetPipelineState(&work.pso);
-                        list.SetComputeRootShaderResourceView(1, shadow.buffer.GetGPUVirtualAddress());
-                        list.SetComputeRootUnorderedAccessView(2, before.GetGPUVirtualAddress());
-                        list.SetComputeRootUnorderedAccessView(3, work.differs.0.GetGPUVirtualAddress());
-                        let runs: Vec<crate::shadow::CardSpan> = if whole.iter().any(|s| Arc::ptr_eq(s, shadow)) {
-                            vec![shadow.card_run(0, usize::MAX)]
-                        } else {
-                            ranges.iter().map(|&(a, b)| shadow.card_run(a, b)).collect()
-                        };
-                        // The same pieces in fewer passes (`rehash_runs`).
-                        let runs = if rehash_runs() { crate::shadow::joined_piece_runs(runs) } else { runs };
-                        CARD_PASSES[0].fetch_add(runs.len() as u64, Ordering::Relaxed);
-                        CARD_PASSES[1].fetch_add(runs.iter().map(|r| u64::from(r.pieces)).sum::<u64>(), Ordering::Relaxed);
-                        for run in runs {
-                            let constants = [run.first, run.skew, size as u32, run.pieces, 0, 0];
-                            list.SetComputeRoot32BitConstants(0, 6, constants.as_ptr().cast(), 0);
-                            list.Dispatch(run.pieces.div_ceil(64), 1, 1);
-                        }
+                    }
+                    if batched {
+                        hashes(list, &synced);
                     }
                     crate::cardmeter::end(list, timed);
                     #[cfg(feature = "diagnostics")]
@@ -4369,11 +5137,12 @@ impl Host {
                         let Some((_, Some(before), size)) = r.shadow.card_sides() else {
                             continue;
                         };
-                        let constants = [r.span.first, r.span.skew, size as u32, r.span.pieces, r.at * 4, if flown { 2 } else { 1 }];
+                        let hashed = r.shadow.card_hashed().unwrap_or(size) as u32;
+                        let constants = [r.span.first, r.span.skew, hashed, r.span.pieces, r.at * 4, if flown { 2 } else { 1 }];
                         list.SetComputeRoot32BitConstants(0, 6, constants.as_ptr().cast(), 0);
                         list.SetComputeRootShaderResourceView(1, r.shadow.buffer.GetGPUVirtualAddress());
                         list.SetComputeRootUnorderedAccessView(2, before.GetGPUVirtualAddress());
-                        list.Dispatch(r.span.pieces.div_ceil(64), 1, 1);
+                        list.Dispatch(card_compare_groups(r.span.pieces), 1, 1);
                         CARD_PASSES[2].fetch_add(1, Ordering::Relaxed);
                     }
                     // The fetch inside the flight (`inflight_fetch`): behind
@@ -4969,6 +5738,7 @@ impl Host {
                 if let Late::Run(flight) = item {
                     *lists += flight.order.len().max(1);
                     ranges.extend(flight.back.iter().flat_map(|(_, r)| r.iter().copied()));
+                    ranges.extend(flight.texture_back_ranges.iter().copied());
                 }
             }
             join_ranges(written, ranges);
@@ -5168,7 +5938,13 @@ impl Host {
         let most = {
             let mut line = line();
             let Line { line: items, written, lists: flying, target, .. } = &mut *line;
-            join_ranges(written, sent.back.iter().flat_map(|(_, ranges)| ranges.iter().copied()));
+            join_ranges(
+                written,
+                sent.back
+                    .iter()
+                    .flat_map(|(_, ranges)| ranges.iter().copied())
+                    .chain(sent.texture_back_ranges.iter().copied()),
+            );
             *flying += order.len();
             *target = *submitted;
             items.push(Late::Run(Flight {
@@ -5178,6 +5954,7 @@ impl Host {
                 order,
                 card: sent.card,
                 back: sent.back,
+                texture_back_ranges: sent.texture_back_ranges,
             }));
             items.extend(sent.writes.into_iter().map(|(at, what, bytes)| Late::Write(at, what, bytes)));
             *flying >= late_most()
@@ -5212,7 +5989,13 @@ impl Host {
         {
             let mut line = line();
             let Line { line: items, written, lists: flying, target, .. } = &mut *line;
-            join_ranges(written, sent.back.iter().flat_map(|(_, ranges)| ranges.iter().copied()));
+            join_ranges(
+                written,
+                sent.back
+                    .iter()
+                    .flat_map(|(_, ranges)| ranges.iter().copied())
+                    .chain(sent.texture_back_ranges.iter().copied()),
+            );
             *flying += 1;
             *target = *submitted;
             items.push(Late::Run(Flight {
@@ -5222,6 +6005,7 @@ impl Host {
                 order: Vec::new(),
                 card: sent.card,
                 back: sent.back,
+                texture_back_ranges: sent.texture_back_ranges,
             }));
             items.extend(sent.writes.into_iter().map(|(at, what, bytes)| Late::Write(at, what, bytes)));
         }
@@ -5401,6 +6185,7 @@ impl Host {
         let mut submitted = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
         let was_working = working(true);
         submitting(1, runs.len());
+        self.video_memory_look();
         // Flights in the air ([`late`]): a submission that is waited for
         // settles them first, one sent ahead only if preparing it reads
         // what they write.
@@ -5454,6 +6239,9 @@ impl Host {
         // wait for the card and the copy-back have their own places on the
         // frame line (run 92 showed them twice, "preparing" 250 ms for 135).
         let mut settled = std::time::Duration::ZERO;
+        // The parts of the preparing, for the line that splits it
+        // ([`PREP_PARTS`]).
+        let mut part = std::time::Instant::now();
         // One write-watch asking for everything the submission refreshes
         // (`VICTORY_ASK_ONCE`): per copy, the span of its refreshed ranges.
         if crate::watch::once() {
@@ -5487,6 +6275,7 @@ impl Host {
             self.settle(&mut submitted, WHY_STALE);
             settled += settling.elapsed();
         }
+        part = prep_part(0, part);
         for list in runs {
             list.run_deferred(&mut batch);
             firsts.push(lists.len());
@@ -5495,8 +6284,10 @@ impl Host {
             }
             lists.push(list.list.cast().ok());
         }
+        part = prep_part(1, part);
         batch.flush();
         crate::watch::ask_once_end();
+        part = prep_part(2, part);
         // The snapshots of the ranges shaders may write, if they were left
         // for now (`crate::shadow::wide_back`): the refreshes are done, the
         // lists have not gone to the card.
@@ -5516,10 +6307,12 @@ impl Host {
             self.settle(&mut submitted, WHY_MOST);
             settled += settling.elapsed();
         }
+        part = prep_part(3, part);
         let card = self.card_before(runs, flown, *submitted);
         if let Some(check) = card.as_ref().and_then(|c| c.check.clone()) {
             lists.push(Some(check));
         }
+        prep_part(4, part);
         let prepared = std::time::Instant::now();
         if late {
             *submitted += 1;
@@ -5529,10 +6322,15 @@ impl Host {
                 self.queue.Signal(&self.fence, *submitted)
             };
             self.card_sent();
+            prep_part(5, prepared);
             if let Err(e) = signalled {
                 fail(format_args!("a submission sent ahead could not be followed by a signal ({e})"));
             }
             let back = declared_writes(runs);
+            let mut texture_back_ranges = Vec::new();
+            for list in runs {
+                texture_back_ranges.extend(list.deferred().texture_backs.iter().map(crate::texback::Back::range));
+            }
             let writes = runs.iter().flat_map(|l| l.deferred().writes.clone()).collect();
             submission_us(0, (prepared - started).saturating_sub(settled).as_micros() as u64);
             submitting(0, 0);
@@ -5542,6 +6340,7 @@ impl Host {
                 number: this_submission,
                 card,
                 back,
+                texture_back_ranges,
                 writes,
             };
             working(was_working);
@@ -5698,20 +6497,78 @@ impl Host {
     /// at and what the draws and dispatches in flight there run (or, in
     /// lists that never started, the pipelines they bind).
     fn removal_data(&self, runs: &[&HostList]) -> String {
+        self.removal_data_of(runs, true)
+    }
+
+    /// [`Host::removal_data`]; `tables`: whether a faulting address is also
+    /// looked up in our own tables (title memory copies, view heaps), which
+    /// takes their locks.
+    ///
+    /// With the data on in any form ([`Dred`]) the report says each of its
+    /// three parts whatever the runtime answered: why the device went, the
+    /// page fault (an address, none reported, or the call failed) and the
+    /// breadcrumbs (how many lists the runtime returned, none, or the call
+    /// failed). Run 277's report had neither a fault nor a breadcrumb, and
+    /// nothing in it said whether the runtime had been asked in vain.
+    fn removal_data_of(&self, runs: &[&HostList], tables: bool) -> String {
+        DATA_SAID.store(true, Ordering::Relaxed);
+        let said = dred_any();
         let Ok(dred) = self.device.cast::<ID3D12DeviceRemovedExtendedData1>() else {
-            return String::new();
+            return if said {
+                "; device-removed data: this device has no interface for it".to_owned()
+            } else {
+                String::new()
+            };
         };
         let mut text = String::new();
         let mut fault_va = None;
+        if said {
+            // SAFETY: a plain query.
+            let reason = match unsafe { self.device.GetDeviceRemovedReason() } {
+                Ok(_) => "none, the device is not removed".to_owned(),
+                Err(e) => format!("{:#010X}", e.code().0),
+            };
+            text.push_str(&format!(
+                "; device-removed data ({}): removal reason {reason}; {} host objects named, {} of them made while frames are drawn",
+                dred_mode().text(),
+                NAMED[0].load(Ordering::Relaxed),
+                NAMED[1].load(Ordering::Relaxed)
+            ));
+            // The runtime can classify a removal even when it supplies no
+            // fault address. Older runtimes still have the DRED1 report below.
+            match dred.cast::<ID3D12DeviceRemovedExtendedData2>() {
+                Ok(dred2) => {
+                    // SAFETY: a query on the live DRED interface.
+                    let state = unsafe { dred2.GetDeviceState() };
+                    let name = match state {
+                        D3D12_DRED_DEVICE_STATE_HUNG => "hung",
+                        D3D12_DRED_DEVICE_STATE_FAULT => "fault",
+                        D3D12_DRED_DEVICE_STATE_PAGEFAULT => "page fault",
+                        D3D12_DRED_DEVICE_STATE_UNKNOWN => "unknown",
+                        _ => "unrecognized",
+                    };
+                    text.push_str(&format!("; DRED device state {name} ({})", state.0));
+                }
+                Err(e) => text.push_str(&format!("; DRED device state unavailable ({:#010X})", e.code().0)),
+            }
+        }
         // SAFETY: the outputs are the runtime's, valid while the device
         // lives; nodes are walked as linked, histories have their counts.
         unsafe {
-            if let Ok(fault) = dred.GetPageFaultAllocationOutput1()
+            let fault = dred.GetPageFaultAllocationOutput1();
+            // Said either way: no address, or no answer at all.
+            match &fault {
+                Ok(f) if said && f.PageFaultVA == 0 => text.push_str("; page fault: no fault address reported"),
+                Err(e) if said => text.push_str(&format!("; page fault: the call failed ({e})")),
+                _ => {}
+            }
+            if let Ok(fault) = fault
                 && fault.PageFaultVA != 0
             {
                 let va = fault.PageFaultVA;
                 fault_va = Some(va);
                 text.push_str(&format!("; page fault at {va:#x}"));
+                let mut found = 0;
                 for (what, head) in [
                     ("inside", fault.pHeadExistingAllocationNode),
                     ("inside freed", fault.pHeadRecentFreedAllocationNode),
@@ -5730,21 +6587,46 @@ impl Host {
                         node = n.pNext;
                     }
                     if !names.is_empty() {
+                        found += names.len();
                         text.push_str(&format!("; {what} {names:?}"));
                     }
                 }
-                text.push_str(&crate::shadow::near(va));
-                text.push_str(&crate::descriptor::host::near_heaps(va));
+                if found == 0 {
+                    text.push_str("; inside no allocation the runtime lists, alive or freed lately");
+                }
+                if tables {
+                    text.push_str(&crate::shadow::near(va));
+                    text.push_str(&crate::descriptor::host::near_heaps(va));
+                }
+            }
+            // `faults` keeps no breadcrumbs: none are asked for.
+            if dred_mode() == Dred::Faults {
+                text.push_str("; breadcrumbs: not kept in this form");
+                return text;
             }
             // The plain output: the extended one (with marker texts) came
             // back without stopped lists on this host.
-            let crumbs = match dred.GetAutoBreadcrumbsOutput() {
+            let mut crumbs = match dred.GetAutoBreadcrumbsOutput() {
                 Ok(crumbs) => crumbs,
                 Err(e) => {
-                    text.push_str(&format!("; no breadcrumbs ({e})"));
+                    if said {
+                        text.push_str(&format!("; breadcrumbs: the call failed ({e})"));
+                    } else {
+                        text.push_str(&format!("; no breadcrumbs ({e})"));
+                    }
                     return text;
                 }
             };
+            // An empty list within a millisecond of the removal (run 277):
+            // asked again for half a second before it is believed.
+            let mut asked = 0u32;
+            while said && crumbs.pHeadAutoBreadcrumbNode.is_null() && asked < 10 {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+                asked += 1;
+                if let Ok(again) = dred.GetAutoBreadcrumbsOutput() {
+                    crumbs = again;
+                }
+            }
             // Every list's progress (done/count), in the runtime's order.
             let mut progress = Vec::new();
             let mut node = crumbs.pHeadAutoBreadcrumbNode;
@@ -5754,6 +6636,18 @@ impl Host {
                 let index = runs.iter().position(|r| Some(r.list.as_raw()) == ours);
                 progress.push(format!("{done}/{} {index:?}", p.BreadcrumbCount));
                 node = p.pNext;
+            }
+            if said {
+                let again = if asked > 0 {
+                    format!(", asked {asked} more times over {} ms", asked * 50)
+                } else {
+                    String::new()
+                };
+                if progress.is_empty() {
+                    text.push_str(&format!("; breadcrumbs: the runtime returned none (nodes 0{again})"));
+                } else {
+                    text.push_str(&format!("; breadcrumbs: data returned (nodes {}{again})", progress.len()));
+                }
             }
             text.push_str(&format!("; breadcrumbs (done/count, list) {progress:?}"));
             let mut plain = crumbs.pHeadAutoBreadcrumbNode;
@@ -5789,7 +6683,12 @@ impl Host {
                     let _ = fault_va;
                     if done > 0 {
                         text.push_str(&in_flight(history, &markers, done as usize));
-                    } else if let Some(r) = run {
+                    }
+                    // A list that never started; and in `light`, where no
+                    // marker says what a command runs, every stopped list.
+                    if (done == 0 || dred_mode() == Dred::Light)
+                        && let Some(r) = run
+                    {
                         let pipelines = r.pipelines.lock().unwrap_or_else(|e| e.into_inner());
                         text.push_str(&format!(", its pipelines {pipelines:?}"));
                     }
@@ -5848,6 +6747,23 @@ impl Host {
                 "D3D12 debug layer messages so far by kind (severity 0 corruption, 1 error, 2 warning, 3 info, 4 message): {}",
                 counts.join(", ")
             );
+        }
+    }
+
+    /// Whether the host device is a software adapter, or cannot be told to
+    /// be a card (WARP: the checks' machine has no card, and tests of what
+    /// only a card does skip there). Told by the adapter's flag or by its
+    /// maker: Microsoft's (0x1414) is the software one under whatever name
+    /// and flags a machine without a card gives it (the flag alone did not
+    /// say so on the checks' machine); an adapter that does not answer
+    /// counts as software too.
+    #[cfg(test)]
+    pub(crate) fn software(&self) -> bool {
+        const MICROSOFT: u32 = 0x1414;
+        // SAFETY: a plain query.
+        match self.adapter.as_ref().and_then(|a| unsafe { a.GetDesc1() }.ok()) {
+            Some(d) => d.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0 || d.VendorId == MICROSOFT,
+            None => true,
         }
     }
 
@@ -6010,6 +6926,7 @@ impl HostList {
 
     pub(crate) fn close(&self) {
         self.twins_to_depth();
+        self.textures_back();
         let scratch = self.indirect_args.lock().unwrap_or_else(|e| e.into_inner()).clone();
         if let Some((scratch, _)) = scratch {
             self.indirect_common(&scratch);
@@ -6064,8 +6981,9 @@ impl HostList {
         self.pipelines.lock().unwrap_or_else(|e| e.into_inner()).clear();
         {
             let mut gather = self.gather.lock().unwrap_or_else(|e| e.into_inner());
-            let Gather { closed, sets, spare, .. } = &mut *gather;
+            let Gather { closed, written, sets, spare, .. } = &mut *gather;
             *closed = false;
+            written.clear();
             for set in sets.drain(..) {
                 if spare.len() < GATHER_SETS {
                     spare.push(set.into_scratch());
@@ -6335,6 +7253,44 @@ impl HostList {
         }
     }
 
+    /// A draw or dispatch being prepared writes title texture `resource`
+    /// through unordered access: if it is of a kind copied back
+    /// ([`crate::texback`]), the list copies it when it closes.
+    pub(crate) fn texture_written(&self, resource: crate::object::This) {
+        if !crate::texback::wanted(resource) {
+            return;
+        }
+        let mut deferred = self.deferred();
+        if !deferred.back_wanted.iter().any(|target| target.owner() == resource as usize)
+            && let Some(target) = crate::texback::Target::new(resource)
+        {
+            deferred.back_wanted.push(target);
+        }
+    }
+
+    /// Before the list closes: the textures its shaders wrote that are copied
+    /// back go into read-back buffers ([`crate::texback::record`]).
+    fn textures_back(&self) {
+        const COPY_SOURCE: u32 = 0x800;
+        let wanted = std::mem::take(&mut self.deferred().back_wanted);
+        for target in wanted {
+            self.settle(&target.copy, COPY_SOURCE);
+            // With device-removed data in its full form: the copies that
+            // follow are named in the breadcrumbs (a stop in them read "op
+            // 8, no marker"). Not otherwise: a note is also a line of a
+            // listed frame and a stamp of a frame shot.
+            #[cfg(feature = "diagnostics")]
+            {
+                if dred_on() {
+                    self.note_op(|| format!("texture read-back of title texture {:#x} (texback)", target.owner()));
+                }
+            }
+            if let Some(back) = crate::texback::record(&self.list, target) {
+                self.deferred().texture_backs.push(back);
+            }
+        }
+    }
+
     /// The draw or dispatch just prepared is recorded: the twins it writes
     /// now hold what their depth textures lack.
     pub(crate) fn twins_written(&self) {
@@ -6495,6 +7451,17 @@ impl HostList {
         self.gather.lock().unwrap_or_else(|e| e.into_inner()).closed = true;
     }
 
+    /// Shaders of the list were declared to write the host copy numbered
+    /// `copy` (`Shadow::gpu_writes`): with
+    /// `crate::indirect::gather_by_copy`, no record of that copy is
+    /// gathered from here on. (Without the switch nothing is noted: the
+    /// list stops gathering whole, as before.)
+    pub(crate) fn gather_wrote(&self, copy: u64) {
+        if crate::indirect::gather_by_copy_kept() {
+            self.gather.lock().unwrap_or_else(|e| e.into_inner()).written.insert(copy);
+        }
+    }
+
     /// A slot for the record at `offset` of the host copy `src` in the
     /// scratch buffer the list's prelude fills (`crate::indirect::gather`,
     /// which checked the record): the buffer and the slot's place in it.
@@ -6504,7 +7471,7 @@ impl HostList {
             None
         };
         let mut gather = self.gather.lock().unwrap_or_else(|e| e.into_inner());
-        if gather.closed {
+        if gather.closed || gather.written.contains(&src_id) {
             return none(1);
         }
         let found = gather
@@ -6576,6 +7543,8 @@ impl HostList {
     fn note(&self, what: impl FnOnce() -> String, range: Option<(u64, u64)>) {
         // A frame shot times the command: the card's clock before it.
         crate::shot::stamp(self);
+        // Only the full form of device-removed data goes on: `light` and
+        // `faults` make no text and set no marker, as with the data off.
         if !dred_on() {
             crate::capture::op(std::ptr::from_ref(self) as usize, what);
             return;
@@ -6615,7 +7584,8 @@ impl HostList {
                 && deferred.kept.is_empty()
                 && deferred.textures.is_empty()
                 && deferred.writes.is_empty()
-                && deferred.backs.is_empty())
+                && deferred.backs.is_empty()
+                && deferred.texture_backs.is_empty())
             {
                 return false;
             }
@@ -6637,6 +7607,33 @@ impl HostList {
             crate::cardmeter::end(&self.list, crate::cardmeter::Span::from_raw(self.pipeline_meter.swap(u32::MAX, Ordering::Relaxed)));
             self.pipeline_meter.store(crate::cardmeter::begin_named(&self.list, name).raw(), Ordering::Relaxed);
         }
+    }
+
+    /// With [`list_reuse`]: whether this is the first time since the reset
+    /// that the list binds the host pipeline at `pipeline` (its interface
+    /// pointer). The list keeps the pipeline from its first bind to its
+    /// reset, so the address names the same one until then, and a later
+    /// bind need not keep it and its root signature again.
+    pub(crate) fn first_bind(&self, pipeline: usize) -> bool {
+        self.deferred().bound.insert(pipeline)
+    }
+
+    /// With [`list_reuse`]: the host GPU address of `len` bytes of upload
+    /// memory holding the title memory at `src` as of the list's
+    /// submission: one copy for every ask until a `Copy` or `Run` step
+    /// intervenes (every fill reads at the submission, in step order, so a
+    /// second fill of the same bytes with neither between them would read
+    /// what the first did).
+    pub(crate) fn fill_scratch(&self, src: *const u8, len: u64) -> Option<u64> {
+        let key = (src as usize, len as usize);
+        let found = self.deferred().filled.get(&key).copied();
+        if let Some(gpu) = found {
+            return Some(gpu);
+        }
+        let (gpu, to) = self.scratch(len)?;
+        self.defer_fill(to, src, len as usize);
+        self.deferred().filled.insert(key, gpu);
+        Some(gpu)
     }
 
     fn deferred(&self) -> std::sync::MutexGuard<'_, Deferred> {
@@ -6663,6 +7660,9 @@ impl HostList {
             .copies
             .push(Step::Copy(dst as usize, src as usize, len));
         deferred.refreshed.clear();
+        if list_reuse_set() {
+            deferred.filled.clear();
+        }
     }
 
     /// Copies `len` bytes of title memory at `src` into the list's upload
@@ -6733,7 +7733,7 @@ impl HostList {
     /// shortcut: one buffer per copy; pool them once uploads are frequent.
     pub(crate) fn upload(&self, host: &Host, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
         let (buffer, data) = host.upload_buffer(size)?;
-        name(&buffer, || format!("list upload {size:#x}"));
+        name_frame(&buffer, || format!("list upload {size:#x}"));
         self.deferred().hold_upload(buffer.clone(), size);
         Some((buffer, data))
     }
@@ -6746,7 +7746,7 @@ impl HostList {
         let len = len.max(1).next_multiple_of(256);
         if len > SCRATCH_CHUNK {
             let (buffer, data) = host.upload_buffer(len)?;
-            name(&buffer, || format!("list scratch {len:#x}"));
+            name_frame(&buffer, || format!("list scratch {len:#x}"));
             // SAFETY: a live buffer.
             let gpu = unsafe { buffer.GetGPUVirtualAddress() };
             self.deferred().hold_upload(buffer, len);
@@ -6980,11 +7980,20 @@ impl HostList {
         self.deferred().textures.insert(key)
     }
 
+    pub(crate) fn alias_source_changed(&self, view: &ID3D12Resource, source: &ID3D12Resource) -> bool {
+        let view = view.as_raw() as usize;
+        let source = source.as_raw() as usize;
+        self.deferred().texture_aliases.insert(view, source) != Some(source)
+    }
+
     /// Runs `work` when the list is submitted, in order with its copies.
     /// `work` may write title memory (refreshes after it copy again).
     pub(crate) fn defer(&self, work: impl Fn() + Send + 'static) {
         self.deferred().copies.push(Step::Run(Box::new(work)));
         self.deferred().refreshed.clear();
+        if list_reuse_set() {
+            self.deferred().filled.clear();
+        }
     }
 
     /// As [`HostList::defer`], for work that writes only host memory.
@@ -7016,6 +8025,8 @@ impl HostList {
                     batch.title_wrote(dst, len);
                     #[cfg(feature = "diagnostics")]
                     fill_check::copy_runs(dst, src, len);
+                    #[cfg(feature = "diagnostics")]
+                    let _reads_as = crate::backreads::reading_as(crate::backreads::TITLE_COPY, 0);
                     copy_mapped(dst as *mut u8, src as *const u8, len, true);
                     // With the submission's one asking: the journal learns it.
                     crate::watch::wrote(dst, len);
@@ -7028,7 +8039,9 @@ impl HostList {
                         add(C::CopyBytes, len as u64);
                         fill_check::runs(src, len);
                     }
-                    copy_mapped(dst as *mut u8, src as *const u8, len, false);
+                    #[cfg(feature = "diagnostics")]
+                    let _reads_as = crate::backreads::reading_as(crate::backreads::TITLE_COPY, 0);
+                    copy_fill(dst as *mut u8, src as *const u8, len);
                     len
                 }
                 Step::Refresh(shadow, address, len) => {
@@ -7365,6 +8378,106 @@ impl Batch {
     }
 }
 
+/// What `VICTORY_LIST_REUSE` says: 0 unset (off), 1 on, 2 in turn.
+fn list_reuse_mode() -> u8 {
+    static MODE: OnceLock<u8> = OnceLock::new();
+    *MODE.get_or_init(|| match std::env::var("VICTORY_LIST_REUSE").as_deref() {
+        Ok("1") => 1,
+        Ok("alt") => 2,
+        _ => 0,
+    })
+}
+
+/// Whether the switch is set at all (`1` or `alt`): what a list remembers
+/// of its fills is then dropped at every `Copy` and `Run` step in both
+/// phases of `alt`, so that nothing remembered in one ON phase is wrong in
+/// the next.
+fn list_reuse_set() -> bool {
+    list_reuse_mode() != 0
+}
+
+/// Whether a list keeps a pipeline it binds once, and copies a root view's
+/// title memory into upload memory once for every bind of the same bytes
+/// (`VICTORY_LIST_REUSE=1`; off by default: kept and copied at every bind,
+/// as before). `alt`: twenty seconds with, twenty without, in turn, each
+/// change said in the log. After darkworldhm's snapshot
+/// (`HostList::bind_pipeline`, `HostList::fill_scratch` there).
+pub(crate) fn list_reuse() -> bool {
+    match list_reuse_mode() {
+        0 => false,
+        1 => true,
+        _ => {
+            static EPOCH: OnceLock<std::time::Instant> = OnceLock::new();
+            let on = (EPOCH.get_or_init(std::time::Instant::now).elapsed().as_secs() / 20) % 2 == 1;
+            static LAST: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(2);
+            if LAST.swap(u8::from(on), Ordering::Relaxed) != u8::from(on) {
+                tracing::info!(
+                    "a list keeps a pipeline once and copies a repeated root view once from now (VICTORY_LIST_REUSE=alt): {}",
+                    if on { "ON" } else { "off, at every bind as usual" }
+                );
+            }
+            on
+        }
+    }
+}
+
+/// Whether a list's fills of under 256 bytes are copied in place
+/// (`VICTORY_FILLS_PLAIN=1`, with `VICTORY_COPY_PLAIN=1`; off by default:
+/// through the kernel's copy, as before). `alt`: twenty seconds with,
+/// twenty without, in turn, each change said in the log.
+///
+/// A fill copies constants the title recorded a draw with into upload
+/// memory of the list's own. `crate::plaincopy` leaves copies that short
+/// to the kernel because the layer's ASKINGS are that short and fail; the
+/// fills are there, and each was a system call
+/// (`crate::plaincopy::copy_short`). The same bytes, read at the same
+/// step; a source page that is gone goes to the kernel's copy as before.
+fn fills_plain() -> bool {
+    /// 0 off, 1 on, 2 in turn.
+    static MODE: OnceLock<u8> = OnceLock::new();
+    match *MODE.get_or_init(|| match std::env::var("VICTORY_FILLS_PLAIN").as_deref() {
+        Ok("1") => 1,
+        Ok("alt") => 2,
+        _ => 0,
+    }) {
+        0 => false,
+        1 => true,
+        _ => {
+            static EPOCH: OnceLock<std::time::Instant> = OnceLock::new();
+            let on = (EPOCH.get_or_init(std::time::Instant::now).elapsed().as_secs() / 20) % 2 == 1;
+            static LAST: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(2);
+            if LAST.swap(u8::from(on), Ordering::Relaxed) != u8::from(on) {
+                tracing::info!(
+                    "a list's fills of under 256 bytes are copied in place from now (VICTORY_FILLS_PLAIN=alt): {}",
+                    if on { "ON" } else { "off, through the kernel's copy as usual" }
+                );
+            }
+            on
+        }
+    }
+}
+
+/// A fill's copy ([`Step::Fill`]): title memory at `src` into upload memory
+/// at `dst`. In place if it is short and [`fills_plain`] says so, else (and
+/// if a source page was not there) as every copy ([`copy_mapped`]).
+fn copy_fill(dst: *mut u8, src: *const u8, len: usize) {
+    #[cfg(feature = "diagnostics")]
+    let timing_only = crate::copystat::mode() != 0;
+    #[cfg(not(feature = "diagnostics"))]
+    let timing_only = false;
+    if len > 0
+        && len < crate::plaincopy::least()
+        && !timing_only
+        && fills_plain()
+        && crate::plaincopy::copy_short(dst, src, len)
+    {
+        #[cfg(feature = "diagnostics")]
+        crate::backreads::touched(src as usize, len, false);
+        return;
+    }
+    copy_mapped(dst, src, len, false);
+}
+
 /// Copies title memory at submission. The ranges were checked against their
 /// resources when recorded, but the title may since have unmapped pages of
 /// them (tiled memory, page mappings), which read as zeros here; a title
@@ -7387,6 +8500,13 @@ pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: b
     }
     if len == 0 {
         return;
+    }
+    #[cfg(feature = "diagnostics")]
+    {
+        crate::backreads::touched(src as usize, len, false);
+        if title_dst {
+            crate::backreads::touched(dst as usize, len, false);
+        }
     }
     // A title destination that is not all mapped is left alone. Asking
     // Windows first (`VirtualQuery`) walks the page tables to the end of
@@ -7489,6 +8609,8 @@ fn read_pieces(src: *const u8, dst: *mut u8, len: usize) {
 /// Reads title memory at `src` into `dst`; false if a page of it is not
 /// readable.
 pub(crate) fn read_into(src: *const u8, dst: &mut [u8]) -> bool {
+    #[cfg(feature = "diagnostics")]
+    crate::backreads::touched(src as usize, dst.len(), false);
     // In place first, if asked for (`crate::plaincopy`): the destination is
     // memory of ours, as in `copy_mapped`.
     crate::plaincopy::copy(dst.as_mut_ptr(), src, dst.len()) || read(src, dst.as_mut_ptr(), dst.len())
@@ -7535,6 +8657,8 @@ fn direct_writes() -> bool {
 pub(crate) fn write_mapped(dst: *mut u8, src: *const u8, len: usize) {
     use windows_sys::Win32::System::Diagnostics::Debug::WriteProcessMemory;
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    #[cfg(feature = "diagnostics")]
+    crate::backreads::touched(dst as usize, len, true);
     let direct = direct_writes();
     let write = |at: usize, n: usize| {
         let from = src.wrapping_add(at - dst as usize);
@@ -7786,6 +8910,9 @@ impl Meter {
         card_clock_line(frames, ms);
         crate::queue2::line(frames);
         crate::plaincopy::line(frames);
+        #[cfg(feature = "diagnostics")]
+        crate::backreads::line(frames);
+        crate::shadow::placed_line();
         if let Some(host) = host() {
             host.drain_messages();
         }
@@ -7913,6 +9040,7 @@ impl Meter {
                 slow[1] as f64 / 1e3 / frames,
                 slow[2] as f64 / 1e3
             );
+            video_memory_line();
             if crate::shadow::cards() {
                 let per_frame = |i: usize| card[i] as f64 / frames;
                 tracing::info!(
@@ -8134,7 +9262,16 @@ impl Host {
             if let Some((buffer, footprint)) = capture {
                 crate::capture::save_read_back(frame, &buffer, &footprint);
             }
-            let _ = p.swap_chain.Present(0, DXGI_PRESENT(0));
+            // What Present answers was thrown away: a removal it is the
+            // first to report then looked as if the next call found it.
+            // Said once (a status that is no error, as "occluded", is not).
+            let shown = p.swap_chain.Present(0, DXGI_PRESENT(0));
+            if shown.is_err() {
+                static ONCE: std::sync::Once = std::sync::Once::new();
+                ONCE.call_once(|| {
+                    tracing::error!("Present answered {:#010x} (said once): the first call to report it, frame {frame}", shown.0 as u32);
+                });
+            }
             p.meter.frame(p.hwnd);
             #[cfg(feature = "diagnostics")]
             return Some(probe.is_some_and(|b| crate::capture::black(&b)));
@@ -8276,7 +9413,29 @@ impl Host {
             );
             self.log_video_memory("right after that change");
         }
+        // For the line between the memory lines ([`video_memory_line`]).
+        VIDEO_PEAK[0].fetch_max(own.CurrentUsage, Ordering::Relaxed);
+        VIDEO_PEAK[1].fetch_min(own.Budget, Ordering::Relaxed);
+        VIDEO_PEAK[2].fetch_max(shared.CurrentUsage, Ordering::Relaxed);
+        VIDEO_PEAK[3].fetch_add(1, Ordering::Relaxed);
         Some([own.Budget, own.CurrentUsage, shared.Budget, shared.CurrentUsage])
+    }
+
+    /// One look at the card's memory of our own, at most every tenth of a
+    /// second, before a submission is prepared: for [`VIDEO_PEAK`], and so
+    /// that a change of the budget is said within a tenth of a second
+    /// ([`Self::video_memory`]). Two plain questions to the system.
+    fn video_memory_look(&self) {
+        if !video_look_on() {
+            return;
+        }
+        static LAST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let now = now_ms();
+        let last = LAST.load(Ordering::Relaxed);
+        if now < last + 100 || LAST.compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed).is_err() {
+            return;
+        }
+        let _ = self.video_memory();
     }
 
     /// Both of the system's memory groups for this process, in bytes: for

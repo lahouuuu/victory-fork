@@ -599,6 +599,74 @@ pub(crate) fn gather(list: &HostList, (src, src_id): (&ID3D12Resource, u64), off
     list.gather_slot(src, src_id, offset, spec)
 }
 
+/// `VICTORY_GATHER_BY_COPY`: 0 off, 1 on, 2 in turn.
+fn gather_by_copy_mode() -> u8 {
+    static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    *MODE.get_or_init(|| match std::env::var("VICTORY_GATHER_BY_COPY").as_deref() {
+        Ok("1") => 1,
+        Ok("alt") => 2,
+        _ => 0,
+    })
+}
+
+/// Whether the copies a list's shaders were declared to write are noted
+/// (`HostList::gather_wrote`): with the switch on, and in both phases of
+/// `alt`, so that the phase that uses the notes finds them whole.
+pub(crate) fn gather_by_copy_kept() -> bool {
+    gather_by_copy_mode() != 0
+}
+
+/// Whether a list stops gathering copy by copy, not whole
+/// (`VICTORY_GATHER_BY_COPY=1`, with `VICTORY_INDIRECT_GATHER=1`; off by
+/// default; `alt`: twenty seconds with, twenty without, in turn, each
+/// change said in the log).
+///
+/// A list's prelude reads the records it gathered before the list runs.
+/// So a record must not be gathered once something recorded in the list
+/// may write it. As before: the first dispatch, and the first draw whose
+/// shaders can store to buffers, ended the list's gathering for every
+/// argument buffer, whatever those shaders write. In the world that left
+/// 1,950 to 2,300 single records a frame with a pass of the layer's own
+/// each, between two waits for every earlier shader write (run 281: "the
+/// list had stopped gathering").
+///
+/// With the switch a record of an argument buffer's host copy is refused
+/// only once the list's shaders were declared to write THAT copy: every
+/// buffer a program is given to write is declared, view by view, root
+/// view by root view and window by window, where the program is prepared
+/// (`Shadow::gpu_writes`; the copy back into title memory depends on the
+/// same declarations), and a write to another host copy of the same bytes
+/// is not seen through this one on the card either way. A pipeline the
+/// layer does not know still ends the gathering whole.
+///
+/// NOT PROVEN EXACT (an independent review, 2026-11-26): three kinds of
+/// shader write are declared nowhere. (1) A buffer the shader picks from
+/// the view heap by an index it computes, and (2) title memory by address
+/// through a copy another list numbered: for programs that can do either
+/// the gathering still ends whole (`State::gather_ends`). (3) An entry of
+/// a descriptor array past the program's used-resource list, and a picked
+/// view that needs no stride: NOT covered. Before this switch is used for
+/// play, a run with it in turn and `VICTORY_INDIRECT_WINDOW_CHECK=1` must
+/// show that "differed" does not grow in the phases with it.
+pub(crate) fn gather_by_copy() -> bool {
+    match gather_by_copy_mode() {
+        0 => false,
+        1 => true,
+        _ => {
+            static EPOCH: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+            let on = (EPOCH.get_or_init(std::time::Instant::now).elapsed().as_secs() / 20) % 2 == 1;
+            static LAST: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(2);
+            if LAST.swap(u8::from(on), std::sync::atomic::Ordering::Relaxed) != u8::from(on) {
+                tracing::info!(
+                    "a list stops gathering indirect records copy by copy from now (VICTORY_GATHER_BY_COPY=alt): {}",
+                    if on { "ON" } else { "off, whole at the first dispatch or storing draw as usual" }
+                );
+            }
+            on
+        }
+    }
+}
+
 /// Since the last line: records that got no slot because they do not fit
 /// the clamp, because their list had stopped gathering, because the list
 /// gathers from too many buffers, because their set was full, because a
@@ -1158,10 +1226,78 @@ void main() {
     /// compare before it, also a change back.
     #[test]
     fn warp_card_compare_stores_the_hash_it_made_when_told() {
+        // Both forms: a thread a piece, and a group a piece (the default).
+        card_compare_on_warp(crate::host::CARD_COMPARE, |pieces| pieces.div_ceil(64));
+        card_compare_on_warp(crate::host::CARD_COMPARE_WIDE, |pieces| pieces);
+    }
+
+    /// Every one-byte change is found, in the piece it is in, with a copy
+    /// that does not start on a piece boundary (`skew`) and a span that
+    /// does not start at piece 0: both forms of the compare.
+    #[test]
+    fn warp_card_compare_finds_every_byte_with_skew() {
+        for (source, groups) in [
+            (crate::host::CARD_COMPARE, (|p: u32| p.div_ceil(64)) as fn(u32) -> u32),
+            (crate::host::CARD_COMPARE_WIDE, |p| p),
+        ] {
+            let Some(mut warp) = WarpHarness::new() else {
+                return;
+            };
+            let compare = compile_cs(&warp.device, source).expect("the card compare must compile on WARP");
+            const PIECE: usize = 64 << 10;
+            const SKEW: u32 = 0x3450;
+            const FIRST: u32 = 1;
+            const PIECES: u32 = 4;
+            let size = PIECE * 6;
+            let (_now, now_ptr, now_gpu) = warp.shared_buffer(size as u64);
+            let (_hashes, _, hashes_gpu) = warp.shared_buffer(16 * 8);
+            let (_differs, differs_ptr, differs_gpu) = warp.shared_buffer(64);
+            let content: Vec<u8> = (0..size).map(|i| (i * 131 + i / 7) as u8).collect();
+            // SAFETY: the mapping holds `size` bytes.
+            unsafe { std::ptr::copy_nonoverlapping(content.as_ptr(), now_ptr, size) };
+            let run = |warp: &mut WarpHarness, mode: u32| -> Vec<u32> {
+                // SAFETY: as in `card_compare_on_warp`.
+                unsafe {
+                    for i in 0..PIECES as usize {
+                        differs_ptr.cast::<u32>().add(i).write_volatile(7);
+                    }
+                    warp.list.SetComputeRootSignature(&compare.root);
+                    warp.list.SetPipelineState(&compare.pso);
+                    let constants = [FIRST, SKEW, size as u32, PIECES, 0, mode];
+                    warp.list.SetComputeRoot32BitConstants(0, 6, constants.as_ptr().cast(), 0);
+                    warp.list.SetComputeRootShaderResourceView(1, now_gpu);
+                    warp.list.SetComputeRootUnorderedAccessView(2, hashes_gpu);
+                    warp.list.SetComputeRootUnorderedAccessView(3, differs_gpu);
+                    warp.list.Dispatch(groups(PIECES), 1, 1);
+                }
+                warp.submit_and_wait();
+                // SAFETY: as above.
+                (0..PIECES as usize).map(|i| unsafe { differs_ptr.cast::<u32>().add(i).read_volatile() }).collect()
+            };
+            run(&mut warp, 0);
+            assert_eq!(run(&mut warp, 1), vec![0; PIECES as usize]);
+            // Piece `FIRST + i` of the copy covers offsets [lo, hi) as the
+            // compare cuts them; a byte there changed flags that piece alone.
+            for (k, step) in [0usize, 1, 15, 16, 1023, 1024, 4095, 30001, 65535].iter().enumerate() {
+                let i = (k % PIECES as usize) as u32;
+                let lo = ((FIRST + i) as usize * PIECE).saturating_sub(SKEW as usize);
+                let at = lo + step % (PIECE - 16);
+                // SAFETY: inside the mapping.
+                unsafe { now_ptr.add(at).write_volatile(content[at] ^ 0x5a) };
+                let flagged = run(&mut warp, 1);
+                assert_eq!(flagged[i as usize], 1, "{source:.20}: byte {at:#x} of piece {i} not found");
+                // SAFETY: inside the mapping.
+                unsafe { now_ptr.add(at).write_volatile(content[at]) };
+                assert_eq!(run(&mut warp, 1), vec![0; PIECES as usize]);
+            }
+        }
+    }
+
+    fn card_compare_on_warp(source: &str, groups: fn(u32) -> u32) {
         let Some(mut warp) = WarpHarness::new() else {
             return;
         };
-        let compare = compile_cs(&warp.device, crate::host::CARD_COMPARE).expect("the card compare must compile on WARP");
+        let compare = compile_cs(&warp.device, source).expect("the card compare must compile on WARP");
         const PIECE: usize = 64 << 10;
         const PIECES: u32 = 3;
         let size = PIECE * PIECES as usize;
@@ -1187,7 +1323,7 @@ void main() {
                 warp.list.SetComputeRootShaderResourceView(1, now_gpu);
                 warp.list.SetComputeRootUnorderedAccessView(2, hashes_gpu);
                 warp.list.SetComputeRootUnorderedAccessView(3, differs_gpu);
-                warp.list.Dispatch(PIECES.div_ceil(64), 1, 1);
+                warp.list.Dispatch(groups(PIECES), 1, 1);
             }
             warp.submit_and_wait();
             // SAFETY: as above.
@@ -1830,7 +1966,11 @@ void main() {
         for i in 0..RECORDS as usize {
             let rec = &out_words[i * 6..(i + 1) * 6];
             if rec[0] == (1 << 22) && rec[1] == 16 {
-                assert!(i == 1 || i == 2, "the first two real draws fit the budget");
+                // WHICH two draws keep the budget is the order the card
+                // runs the threads in, which nothing fixes (the software
+                // device gave another two in five runs of seven): only how
+                // many is the clamp's to say, below.
+                assert_ne!(i, 0, "the record that is no draw charges nothing and is not kept as one");
                 kept += 1;
             } else {
                 assert_eq!((rec[0], rec[1]), (0, 0), "excess draw must be zeroed");
@@ -2450,7 +2590,8 @@ void work() {
         heap_pairs: [[Option<ID3D12DescriptorHeap>; 2]; 2],
         tables: [D3D12_GPU_DESCRIPTOR_HANDLE; 2],
         targets: [D3D12_CPU_DESCRIPTOR_HANDLE; 2],
-        depth_written: D3D12_CPU_DESCRIPTOR_HANDLE,
+        /// Kept beside `depth_tested` (the view the rig clears through when it is made).
+        _depth_written: D3D12_CPU_DESCRIPTOR_HANDLE,
         depth_tested: D3D12_CPU_DESCRIPTOR_HANDLE,
         stamps: ID3D12QueryHeap,
         back: ID3D12Resource,
@@ -2758,7 +2899,7 @@ void work() {
                     heap_pairs,
                     tables,
                     targets,
-                    depth_written,
+                    _depth_written: depth_written,
                     depth_tested,
                     stamps,
                     back,

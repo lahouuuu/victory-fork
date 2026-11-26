@@ -203,7 +203,17 @@ pub(crate) fn sync_heaps() {
         // Capped host heaps have no counterparts for the title slots reserved
         // for per-draw tables; raw writes there must not be mirrored.
         let mirrored_count = heap.desc.count.min(host.count());
-        for (range_from, range_end) in written.take(start as usize, end as usize) {
+        // With `VICTORY_HEAP_SYNC_CUT`: only the pages that hold slots the
+        // host heap has title slots for are taken and read ([`sync_cut`]).
+        let looked_end = if sync_cut() {
+            (start as usize).saturating_add(mirrored_count as usize * step as usize).min(end as usize)
+        } else {
+            end as usize
+        };
+        let asking = std::time::Instant::now();
+        let ranges = written.take(start as usize, looked_end);
+        SYNC_PARTS[0].fetch_add(asking.elapsed().as_micros() as u64, Relaxed);
+        for (range_from, range_end) in ranges {
             let mut page = range_from & !(crate::watch::PAGE - 1);
             while page < range_end {
                 let from = page.max(range_from);
@@ -212,7 +222,10 @@ pub(crate) fn sync_heaps() {
                 // copy: a page the title unmaps meanwhile fails the read
                 // where 2,048 reads in place would fault.
                 page_bytes.resize(to - from, 0);
-                if crate::host::read_into(from as *const u8, &mut page_bytes) {
+                let reading = std::time::Instant::now();
+                let read = crate::host::read_into(from as *const u8, &mut page_bytes);
+                SYNC_PARTS[1].fetch_add(reading.elapsed().as_micros() as u64, Relaxed);
+                if read {
                     pages += 1;
                     let slots = changed_slots(from, to, start as usize, step, mirrored_count);
                     // The page's records in one go, under one lock
@@ -254,6 +267,57 @@ pub(crate) fn sync_heaps() {
     }
 }
 
+/// Whether [`sync_heaps`] leaves alone the part of a title view heap the
+/// host heap has no title slots for (`VICTORY_HEAP_SYNC_CUT=1`; off by
+/// default; `alt`: twenty seconds with, twenty without, in turn, each
+/// change said in the log).
+///
+/// On a host that caps view heaps at 1,000,000 the host heap holds the
+/// title's slots below 737,855 and the title's heap has 1,245,184. The
+/// records past the host's title slots were never mirrored
+/// ([`changed_slots`] cuts them off), but their pages were asked about and
+/// read all the same, and they are the busiest of the heap: the title
+/// keeps its own per-draw tables there and rewrites them every frame
+/// (measured in run 285 with an instrument since removed: about 100,000
+/// records a frame that are not zeros, a third of them live view objects,
+/// a fifth constant views; about half of the changed pages a frame). The
+/// layer serves those tables from slots of its own when a draw names
+/// them. With the switch the pass asks the write watch about, and reads,
+/// the mirrored part only: the same records are mirrored.
+#[cfg(windows)]
+fn sync_cut() -> bool {
+    /// 0 off, 1 on, 2 in turn.
+    static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    match *MODE.get_or_init(|| match std::env::var("VICTORY_HEAP_SYNC_CUT").as_deref() {
+        Ok("1") => 1,
+        Ok("alt") => 2,
+        _ => 0,
+    }) {
+        0 => false,
+        1 => true,
+        _ => {
+            static EPOCH: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+            let on = (EPOCH.get_or_init(std::time::Instant::now).elapsed().as_secs() / 20) % 2 == 1;
+            static LAST: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(2);
+            if LAST.swap(u8::from(on), std::sync::atomic::Ordering::Relaxed) != u8::from(on) {
+                tracing::info!(
+                    "the pass over the title's view heap leaves the part the host has no title slots for alone from now                      (VICTORY_HEAP_SYNC_CUT=alt): {}",
+                    if on { "ON" } else { "off, every changed page is read as usual" }
+                );
+            }
+            on
+        }
+    }
+}
+
+/// Microseconds of [`sync_heaps`] by part, since its line last took them:
+/// asking the write tracking which pages changed, reading the pages, the
+/// walk over their records (`HostHeap::mirror_copied_page`), and making
+/// the host slots of the records that changed. An instrument: the pass is
+/// 8 to 13 ms a frame and cutting the pages read took nothing off it (run
+/// 286).
+pub(crate) static SYNC_PARTS: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+
 /// Since the last frame line, of [`sync_heaps`]: changed pages of placed
 /// shader-visible heaps looked at, slots on them, slots whose record was
 /// not the one last seen (mirrored), and the microseconds it took.
@@ -276,6 +340,14 @@ pub(crate) fn sync_line(frames: f64) {
         mirrored as f64 / frames,
         host::COPIED_TABLED.swap(0, std::sync::atomic::Ordering::Relaxed) as f64 / frames,
         micros as f64 / 1000.0 / frames
+    );
+    let parts = [0, 1, 2, 3].map(|i| SYNC_PARTS[i].swap(0, std::sync::atomic::Ordering::Relaxed) as f64 / 1e3 / frames);
+    tracing::info!(
+        "the pass over the title's view heap by part, ms per frame: asking which pages changed {:.2}, reading the pages {:.2},          the walk over their records {:.2}, making the host slots of the changed records {:.2}",
+        parts[0],
+        parts[1],
+        parts[2],
+        parts[3]
     );
 }
 
@@ -889,7 +961,61 @@ pub(crate) fn forget(resource: usize) {
         // The view's other resource (a counter) keeps a stale entry, which
         // `forget` of that resource skips.
         views.free.push(i);
+        if crate::heap_pass::marked_set() {
+            note_forgotten(i);
+        }
     }
+}
+
+/// With `VICTORY_HEAP_PASS_MARKED` (`crate::heap_pass`): table entries
+/// freed since the pass over the heap's buffer views last asked
+/// ([`take_forgotten`]): records that name them read nothing now, though no
+/// slot was written. Kept only once a pass has asked.
+static FORGOTTEN: std::sync::Mutex<(bool, bool, Vec<u32>)> = std::sync::Mutex::new((false, false, Vec::new()));
+
+/// More entries than this between two asks: the list is dropped, and the
+/// next ask is told it does not know.
+const FORGOTTEN_MOST: usize = 1 << 20;
+
+fn note_forgotten(i: u32) {
+    let mut forgotten = FORGOTTEN.lock().unwrap_or_else(|e| e.into_inner());
+    let (asked, overflowed, list) = &mut *forgotten;
+    if !*asked || *overflowed {
+        return;
+    }
+    if list.len() >= FORGOTTEN_MOST {
+        *overflowed = true;
+        *list = Vec::new();
+        return;
+    }
+    list.push(i);
+}
+
+/// The table entries freed since the last call (in any order, maybe
+/// twice); `None` on the first call and when too many were to be kept.
+pub(crate) fn take_forgotten() -> Option<Vec<u32>> {
+    let mut forgotten = FORGOTTEN.lock().unwrap_or_else(|e| e.into_inner());
+    let (asked, overflowed, list) = &mut *forgotten;
+    let known = *asked && !*overflowed;
+    *asked = true;
+    *overflowed = false;
+    let list = std::mem::take(list);
+    known.then_some(list)
+}
+
+/// The record at `handle` (a descriptor slot in title memory): its tag and
+/// two words, read as they are.
+pub(crate) fn record_at(handle: u64) -> [u32; 3] {
+    // SAFETY: the handle is a descriptor slot in title memory, at least 16
+    // bytes.
+    unsafe { (handle as *const [u32; 3]).read_unaligned() }
+}
+
+/// The view table entry a record names, if it names one (not a view named
+/// whole in its record, not a record of no view).
+pub(crate) fn record_entry(record: [u32; 3]) -> Option<u32> {
+    let [tag, i, generation] = record;
+    (tag == VIEW_TAG && generation >> KIND_SHIFT == 0).then_some(i)
 }
 
 /// The view the record words `i` and `generation` name: the one they hold

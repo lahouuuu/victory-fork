@@ -83,6 +83,19 @@ pub fn load(prepared: &PreparedImage, dir: &Path) -> Result<LoadedImage> {
     if !loaded.info.is_dll() {
         // SAFETY: just mapped, and no title code has run.
         unsafe { crate::tls::redirect(loaded.base(), &loaded.info) }?;
+        // LOCAL (nvidia2): `VICTORY_NO_WATCHDOG=1` (off by default; see
+        // `hooks.rs`): the title's watchdog disarmed, for the 1.0.2.1 build
+        // only and where its bytes are the expected ones.
+        if crate::hooks::no_watchdog() {
+            // SAFETY: just mapped, and no title code has run.
+            let applied =
+                unsafe { crate::hooks::disarm_watchdog(loaded.base(), &prepared.original_hash) };
+            tracing::info!(
+                applied,
+                "title watchdog hooks ({})",
+                crate::hooks::NO_WATCHDOG_ENV
+            );
+        }
     }
     tracing::info!(
         base = format_args!("{:#x}", loaded.base()),

@@ -25,6 +25,9 @@
 mod console_insn;
 mod crash;
 pub mod frame_rate;
+// LOCAL (nvidia2): VICTORY_NO_WATCHDOG, ported from our branch nvidia.
+#[cfg(windows)]
+mod hooks;
 pub mod prepare;
 pub(crate) mod publish;
 pub mod resolve;

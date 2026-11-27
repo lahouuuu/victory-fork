@@ -625,3 +625,86 @@ CLAUDE.md, rule #1).
   copystat.rs, VICTORY_DYNAMIC_SLOTS in descriptor/host.rs; the values are in that fork's
   apps/victory/src/tuned.rs, not in our tree). Later: the newer nvidia/main (9d6300f: DLSS,
   frame generation) audited and measured; the stretching and the prelude crashes.
+
+## Session 7 — fps: brothernog/rota's settings already in our base, release vs diag build (2026-11-27)
+- Branch / start commit / end commit: nvidia / fab61f9 (= origin/nvidia) / the commit that
+  adds this entry. No code changed. Nothing pushed.
+- Task given: the fastest command on this PC with rota's settings (VICTORY_CARD_ALL=1,
+  VICTORY_MEMORY_CARD_MB=1024, VICTORY_MEMORY_MAP=0, VICTORY_CARD_STEPS=1,
+  VICTORY_DYNAMIC_SLOTS=499999), read in OUR tree first; whether a release build can be run.
+- Start state (read only): page file C: only, 49,152-65,536 MB, commit limit 63.9 GB.
+- What the switches do in our tree, and what play-nvidia.ps1 already sets:
+  - `VICTORY_CARD_ALL=1` (shadow.rs `card_all`, off): the least size of a title buffer whose
+    copy gets a side in the card's memory goes to 0 (the script's VICTORY_CARD_BUFFERS_MIN_MB=1
+    gives 1 MB: logged `card_buffers_min_kb=1024` without it, `0` with it), while the card has
+    room; a copy refused there gets two sides in the PC's memory. So small buffers on the
+    card, as rota describes.
+  - `VICTORY_MEMORY_CARD_MB` (shadow.rs `by_address`): the most of the card's memory for copies
+    of memory that shaders read by address (ray structures); default 4,096, rota 1,024; past
+    it those copies stay in the PC's memory. Not set by the script.
+  - `VICTORY_MEMORY_MAP=0` (copystat.rs, diagnostics builds only): leaves out the walk of the
+    address space done with every sixth memory line, which "holds up other threads' memory
+    calls for its length (89 ms for the 6.2 GB pool)". On by default in diag; absent in release.
+  - `VICTORY_CARD_STEPS` (host/card_steps.rs): 1 = constant buffers of descriptor tables done
+    on the card behind the flights, 2 = the title's buffer copies too. The script sets 2.
+  - `VICTORY_DYNAMIC_SLOTS` (descriptor/host.rs `dynamic_slots`): on NVIDIA's view heap capped
+    at 1,000,000 the value asked is clamped to at most half the heap: the script's 524,288 and
+    rota's 499,999 both give 499,999 (Session 6's log: `slots=499999 title_in_place=500000`).
+    The script's value kept: no difference.
+- Release build: play-nvidia.ps1 takes `-Build release`. Built (`cargo build --locked --release
+  -p victory`, 9,968,128 bytes; the old one was main's from Session 1). In it the ray-tracing
+  skip list (VICTORY_SKIP_PIPELINES, rt_off_hashes.txt) does not exist (pipeline.rs, under the
+  diagnostics feature), so the 1,034 shaders the diag build skips run; the script warns that
+  rooms then go white with the view angle. Diag-only costs: the copystat lines and the memory
+  map walk (above), timeline spans, extra timing.
+- Tests (fab61f9, same code as Session 6):
+  - fmt: FAIL, 2,788 diffs (Session 6: 2,788).
+  - clippy: FAIL, 38 errors; clippy all-features: FAIL, 36 (Session 6: 38 / 36).
+  - test: 927 passed, 0 failed (Session 6: 927).
+  - policy: pass (265 files).
+  - `cargo build --locked --release -p victory`: OK.
+- Measurements (Session 6's recommended command = R0; Series S, world at 540p; same boot,
+  15.3-16.2 GB committed at each launch; first room 3 min from when the user said, then the
+  room with many characters 3 min; frame split = median of the layer's frame lines):
+
+  | | R0 | R1 = R0 + CARD_ALL=1, MEMORY_CARD_MB=1024, MEMORY_MAP=0 | R2 = R1 + CARD_STEPS=1 | R3 = R1, release build |
+  |---|---|---|---|---|
+  | first room: mean fps, median ms (p90) | 7.1, 136 (177) [67 s only] | **9.1, 101 (161)** | 8.6, 120 (143) | 7.9, 123 (152) [window estimated] |
+  | room with many characters: mean fps, median ms (p90) | 7.8, 126 (158) | 8.4, 124 (154) | 9.4, 115 (144) | 8.6, 111 (163) [117 s, a cutscene began] |
+  | weighted over both | 7.6 | **8.8** | 9.0 | 8.2 |
+  | samples > 300 ms (room / many) | 4 % / 5 % | 2 % / 0 % | 0 % / 0 % | 0 % / 0 % |
+  | split CPU / GPU / copy back, first room (ms) | 77 / 0 / 32 | **64 / 0 / 28** | 64 / 26 / 30 | 82 / 0 / 37 |
+  | victory CPU, share of the machine | 44-47 % | 43-46 % | 40-45 % | 61-65 % |
+  | textures waiting at the end of the first room | 5,547 | 2,024 | 3,822 | 196 |
+  | lowest free RAM; peak commit system | 0.21; 43.8 GB | 0.19; 44.2 | 0.32; 44.5 | 0.02; 43.6 |
+  | peak GPU memory | 8.3 GB | 8.5 | 8.4 | 7.8 |
+  | picture (the user) | as usual | a face black for a while, then drawn | NEW: part of the walls black in the room with many characters only (joints right), not seen before | looks better, less stretching |
+  | crash | no | no | no | no |
+
+  A first R0 launch was not used: the user went on without saying when they entered the room
+  and closed the window. In R0 the user left the first room after 67 s.
+- Reading: R1 is about 1.2 fps over R0 (one run each), with less CPU preparing (64 vs 77 ms)
+  and copying back. R2 is 0.25 fps over R1 (within one run's noise), brings the GPU wait back
+  (10-26 ms, as -Quality did) and a new visible fault (black walls): not kept. R3 is slower
+  than R1 (8.2 vs 8.8; the CPU more busy, likely the ray-tracing passes the diag build skips),
+  but the user found its picture better with less stretching and it had far fewer textures
+  waiting: a picture trade, not a speed one, and its windows are less exact.
+- Recommended command (branch nvidia, diag build): R1:
+  `.\scripts\play-nvidia.ps1 -Exe <title exe> -NoSmoothMotion -More @{VICTORY_NO_WATCHDOG='1';
+  VICTORY_THIN='0'; VICTORY_PIPELINE_WAIT_MS='150'; VICTORY_PIPELINE_WORKERS='4';
+  VICTORY_TEXTURE_STAGE_MB='512'; VICTORY_TEXTURE_STAGE_MS='50'; VICTORY_FETCH_CHECK='1';
+  VICTORY_CARD_ALL='1'; VICTORY_MEMORY_CARD_MB='1024'; VICTORY_MEMORY_MAP='0'}`
+  The fastest without a new serious fault. What it gives up: R3's picture (release build,
+  about -0.6 fps).
+- What did NOT work or was taken back out: VICTORY_CARD_STEPS=1 (black walls). The release
+  build as a speed gain.
+- Open problems found (not fixed):
+  - R2: part of the walls black in one room with VICTORY_CARD_STEPS=1.
+  - The release build runs the ray-tracing passes the diag build skips; that it looked better
+    (less stretching) was not expected and is one user's look at one run.
+  - Free RAM still falls to 0.02-0.3 GB in every run.
+- Questions for the user / PM: whether the release build's look (less stretching, textures
+  in time) is worth about 0.6 fps; it would also need R1's settings checked there (MEMORY_MAP
+  does not exist in it).
+- Suggested next task: confirm R1 vs R0 with a second run each (one run each so far); then
+  the release build with R1's settings again, the first room watched from the same entry.

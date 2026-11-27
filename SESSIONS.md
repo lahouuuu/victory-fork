@@ -909,3 +909,95 @@ CLAUDE.md, rule #1).
     visible"), though still far from the console versions.
   - A free launch after Session 9 (recommended command, not measured) ended normally (window
     closed); no crash.
+
+## Session 10 — nvidia2 updated to trustno1 ca9c75c; V1, U (not run), W = AMD FSR 3 frame generation (2026-11-27)
+- Branch / start commit / end commit: nvidia2 / f9e3b0d (= origin/nvidia2) / 183d75b ("trustno1
+  48ad7859..ca9c75c, squashed") + the commit that adds this entry. Nothing pushed.
+- Task given: bring nvidia2 up to trustno1's newest commit in one commit, audit, checks, then V1
+  (Session 9's command on the new build), U (V1 + VICTORY_AMBIENT_SPECULAR=1) and W (the better of
+  V1/U + AMD FSR 3 frame generation 2x, AMD's DLLs allowed from AMD's GitHub only).
+- Update: trustno1-coder/VIctory-NVIDIA's newest commit at the fetch was ca9c75c (2026-11-27 10:12
+  -0800), one after 29d8dbf (AMD FSR 3 frame generation): taken. The changes 48ad7859..ca9c75c (31
+  commits, 33 files) applied on nvidia2 with `git apply --3way`: no conflict; none of them touches
+  our VICTORY_NO_WATCHDOG (a94ad08) or our .md files. The resulting tree is exactly ca9c75c's plus
+  our files, minus the two removed below. None of trustno1's commits is in our history.
+- Audit, rule #1 and safety (before building): asset policy passes (283 files). No binary, log,
+  image, capture or executable added; no machine path or personal identifier. REMOVED before the
+  commit: PLAY_FRAMEGEN.cmd and scripts/play-gta6-framegen.ps1, a one-click launcher that names
+  one of the title's data files to recognise its folder, searches every drive for it, copies the
+  saves outside the repository and %LOCALAPPDATA%\victory (to D:\ or the user profile), reads
+  the registry (read only) and runs the NVIDIA download script. No new build.rs, no new crate;
+  victory-hle's windows-sys asks three more API sets (device and HID access for a new DualSense
+  module, GDI). FSR 3 (crates/victory-gpu/src/streamline/fsr.rs) downloads nothing: it loads
+  AMD's two DLLs from VICTORY_FIDELITYFX_DIR (else amd-sdk\FidelityFX\bin in the repository) and
+  checks their signatures. Their launcher now makes FSR 3 frame generation "ready and off" at
+  every start (VICTORY_FSR_FRAMEGEN=1, FRAMEGEN_X=0; without the DLLs it stays off) and sets
+  VICTORY_TEXTURE_ROOM_PERCENT=86 (80 with frame generation on).
+- Tests (183d75b; Session 9: fmt 3,363, clippy 42, 1,031 passed + 2 known failures):
+  - fmt: FAIL, 3,462 diffs. The 99 more are all in files the update changed (1,316 -> 1,415 in
+    those files; the others unchanged at 2,047): trustno1's new code, not ours. Not fixed.
+  - clippy: FAIL, 42 (`--keep-going`); all-features: 40. Same as Session 9.
+  - test: 1,057 passed, the same 2 known failures (victory-gpu indirect tests), 46 ignored.
+  - policy: pass. Release build: OK.
+- Shaders ahead of time (the translator changed: emit/lower.rs, shader_cache.rs): 25,760
+  translated, 225 not, 275 s. Two warm-up launches (the first one stopped in the first room by
+  a misunderstanding; the second went to the room with many characters).
+- U not run, and why: the three light switches were already on in T1, T2 and V1, set by
+  play-foxhound.ps1 (which play-nvidia.ps1 calls): the launch logs read VICTORY_AMBIENT=0.8,
+  VICTORY_AMBIENT_AIR=1.5, VICTORY_AMBIENT_SPECULAR=1. So U = V1. Also, in T1's log the
+  reflection stand-in (ambient.rs, VICTORY_AMBIENT_SPECULAR) never ran: all 38 of its 10 s lines
+  say 0 frames and 0 dispatches followed (the title's miss pass it follows is among the
+  ray-tracing passes this base leaves out); the diffuse stand-in was made. That is why the eyes
+  and floors still take the sky's light. Not changed (no code task).
+- AMD's DLLs for W (with the PM's permission): amd_fidelityfx_loader_dx12.dll (39,184 bytes) and
+  amd_fidelityfx_framegeneration_dx12.dll (29,679,376 bytes) from GPUOpen-LibrariesAndSDKs/
+  FidelityFX-SDK tag v2.4.0, Kits/FidelityFX/signedbin/ (the release ships them in the source
+  tree; only these two files fetched), into %LOCALAPPDATA%\victory\fidelityfx (outside the
+  repository). Both signed by Advanced Micro Devices (valid); their git blob hashes match AMD's
+  tree. The layer's log: "AMD's FidelityFX DLLs loaded (signatures valid)".
+- W, how it is started and what went wrong first: FSR 3 frame generation needs the line of
+  submissions (VICTORY_THIN=1; V1 has 0) and makes the title render through its FidelityFX path at
+  VICTORY_DLSS_MODE's scale. A first start (scale unset: dlaa, 1.0 of the 1080p output) stopped
+  16 s in on the title's own breakpoint (0x80000003, in title code, during start-up); the title's
+  crash reporter's upload was blocked by the layer. With VICTORY_DLSS_MODE=quality (0.667: V1's
+  1280x720 scene) it ran to the end. (Also: play-nvidia.ps1 only passes @args on, which loses a
+  switch given in a splatted table; typed on a command line it is fine.)
+- Measurements (nvidia2 183d75b, release, Series S, 1280x720 scene, VICTORY_NO_WATCHDOG=1 applied=2
+  in each; one boot; 16.9-17.5 GB committed at each launch; first room 3 min from when the user
+  said (W: 103 s, the user went on), then the room with many characters 3 min from leaving the
+  first room (the user walked through it toward a desk both times)):
+
+  | | T1 (Session 9) | T2 (Session 9) | V1 | W (V1 + FSR 3 2x, THIN=1) |
+  |---|---|---|---|---|
+  | first room: fps rendered / shown | 8.0 | 9.6 | 7.1 / 7.1 | 7.6 / **14.8** |
+  | first room: median ms (p90), > 300 ms | 111 (595), 16 % | 100 (131), 0 % | 125 (665), 17 % | 117 (406), 11 % |
+  | many characters: fps rendered / shown | 13.0 | 10.6 | 11.7 / 11.7 | 11.6 / **23.2** |
+  | many characters: median ms (p90), > 300 ms | 74 (96), 0 % | 86 (203), 5 % | 83 (104), 0 % | 84 (105), 0 % |
+  | rendered fps over both (shown) | 10.9 | 10.3 | 9.4 | 10.1 (20.0) |
+  | split CPU / GPU / copy back, many characters (ms) | 57 / 3 / 25 | 63 / 2 / 26 | 60 / 2 / 25 | - |
+  | lowest free RAM; peak commit system | 0.42; 42.9 | 0.00; 44.4 | 0.34; 43.4 | 0.14; 43.9 GB |
+  | peak GPU memory | 9.3 GB | 9.1 | 8.3 | 7.9 |
+  | crash | no | no | no | no (first W start: the title's breakpoint at 16 s, see above) |
+
+  The update brings no visible rendered-fps gain: V1 is within S1/T1/T2's 9.4-10.9. W costs no
+  rendered fps and shows twice as many frames (the window caption gives both). One run each.
+- Picture and feel (the user): V1: eyes a little better, still white under some angles; glasses,
+  floor and haze "fine", but still not the picture expected of the game. W: "at times much
+  smoother"; the controller feels a little slow, the same as in V1 (frame generation adds no lag
+  the user felt); no trails or smearing seen.
+- Recommended command, rendered fps first (branch nvidia2, release build, its own cache folder):
+  V1, i.e. Session 9's: `.\scripts\play-nvidia.ps1 -Exe <title exe> -SeriesS -Dlss off -More
+  @{VICTORY_THIN='0'; VICTORY_NO_WATCHDOG='1'}`.
+  Frame generation is worth it to the eye: W renders as fast and shows about twice the frames,
+  with no lag or trails the user noticed. Command (AMD's two DLLs in a folder outside the
+  repository named by VICTORY_FIDELITYFX_DIR):
+  `$env:VICTORY_FIDELITYFX_DIR = "$env:LOCALAPPDATA\victory\fidelityfx"` then
+  `.\scripts\play-nvidia.ps1 -Exe <title exe> -SeriesS -Dlss off -FrameGen -FgType fsr -More
+  @{VICTORY_THIN='1'; VICTORY_NO_WATCHDOG='1'; VICTORY_DLSS_MODE='quality'}`
+- What did NOT work or was taken back out: U (identical to V1); W at the default scale (dlaa) on
+  Series S (the title's breakpoint at start); the two one-click launcher files (removed).
+- Open problems found (not fixed): the reflection stand-in never runs (white eyes); the first
+  room still starts with many long frames; fmt +99 from the update; the 2 known failing tests.
+- Questions for the user / PM: whether to take W's command as the one to play with.
+- Suggested next task: make the reflection stand-in run (or find which pass it should follow in
+  this base), since it is what the white eyes and floors come from.

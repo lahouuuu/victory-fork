@@ -898,3 +898,14 @@ CLAUDE.md, rule #1).
 - Questions for the user / PM: none open.
 - Suggested next task: the cutscenes (they start while pipelines and textures are still being
   made), or the newer trustno1 commits (up to d12eb1b) on nvidia2.
+- Addendum to Sessions 8 and 9 (found after the Session 9 commit, while checking a free launch):
+  - CORRECTION to Session 8: S4 (Series X 1440p + DLSS Quality) did crash, at about t = 650 s
+    (16:21:26), just after its measured window (456-636 s) and seconds before it was to be
+    closed: unhandled exception 0xc0000005 in the NVIDIA driver's user-mode DLL (a read at 0xc),
+    recorded in crashes.log; its launcher ended with code 5, not the 255 of a forced close. Session
+    8's table says "no" for S4: that is wrong. S4's numbers stand (taken before the crash). So
+    both Series X 1440p profiles ran out of memory and S4 also ended in a driver fault.
+  - Session 9, T2: the user adds that the arrival cutscene showed more than before ("more things
+    visible"), though still far from the console versions.
+  - A free launch after Session 9 (recommended command, not measured) ended normally (window
+    closed); no crash.

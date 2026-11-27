@@ -272,3 +272,238 @@ CLAUDE.md, rule #1).
   fork's, 633 commits) or bring its watchdog switch and E's settings to main.
 - Suggested next task: measure E's set at 720p (`-Resolution 720`) in the same place, and record
   a pipeline book (`VICTORY_PIPELINE_BOOK=1`) so `warm --used` can work; then decide the base.
+
+## Session 4 — avatar-nvidia: avatarmanz 2de99801 + trustno1 033be27 squashed, measured against nvidia (2026-11-26)
+- Branch / start commit / end commit: avatar-nvidia (new, local, from nvidia 20537b5) / 20537b5 /
+  the commit that adds this entry. Commits: ceb95a3 (the squash, one parent 20537b5), 4547204
+  (tests and notes after the squash), then this entry with PM_HANDOFF.md as received. main
+  (040e82e) and nvidia (20537b5) not moved. Nothing pushed.
+- Task given: rebuild the NVIDIA fixes on avatarmanz/VIctory-7900XTX frozen at 2de99801 without
+  its history (PM option 2: one squashed commit, conflicts settled for the NVIDIA fixes, each one
+  noted), PORT_* off by default, audit before building, checks no worse than Session 3, diag
+  build, then measure in the first room: G = nvidia build, H = avatar-nvidia, I = H + the five
+  PORT_*, J = the better at 720p; all with Session 3's recommended set and
+  VICTORY_PIPELINE_BOOK=1. Time limit 4 h for the integration (the PM later allowed more for the
+  measurements).
+- Why not a cherry-pick: the PORT_* commits (86dc109, 4b82f6c, 9c23e8d, 9997d25, 4cb90be,
+  3920dc2, 9d723e8 and its fixes, 673be0e, a609a2f, a39509f) build on about 60 earlier avatarmanz
+  commits; cherry-picking them alone did not apply. trustno1 forked avatarmanz at 0a43566 and
+  added 13 commits; those 13 were replayed on 2de99801.
+- What was done (files, switches added): the tree of avatarmanz 2de99801 with trustno1's 13
+  commits replayed on it, committed as one commit on top of 20537b5; our 4 .md files kept as on
+  nvidia. No file removed. Conflicts and what was kept:
+  - Interface plane (trustno1 7997a20): avatarmanz's own two-plane compose kept (compose.rs,
+    queue.rs, host.rs; `VICTORY_PLANES`, on by default); trustno1's compose plumbing and its
+    duplicate module dropped. The `VICTORY_BVH_MISS` shader-cache key kept. README item 9 now
+    says so: the switch `play-nvidia.ps1` sets for the plane is not read on this tree.
+  - Loader (afd84de): both module lists kept. Render scale: `VICTORY_RENDER_SCALE` is applied by
+    NVIDIA's hooks.rs (with `VICTORY_OWN_UPSCALER`); avatarmanz's own branch in resolution.rs
+    for the same switch removed, since both patch the same upscaler (comment `LOCAL
+    (avatar-nvidia)` there). VICTORY_NO_WATCHDOG: NVIDIA's (avatarmanz has none).
+  - 77e13a9 (faces, ray tracing off, picture fixes): ambient.rs keeps both helpers (avatarmanz's
+    pacing and NVIDIA's `most()`); shader cache decode reads NVIDIA's half views; pipeline/make.rs
+    keeps NVIDIA's single wait; emit/lower.rs adds NVIDIA's `nan_scrub()` (VICTORY_NAN_SCRUB:
+    NVIDIA's, avatarmanz has none); emit exports are the union; descriptor/host.rs NVIDIA's
+    VICTORY_FAIR_DUE doc, avatarmanz's view-address write; draw.rs takes avatarmanz's TablePlan
+    plus NVIDIA's half-view loop, NVIDIA's "tables past the host heap" loop dropped (avatarmanz's
+    snapshot check covers it), relook pacing NVIDIA's `VICTORY_RELOOK_MS` with avatarmanz's
+    frame-time pacing when it is known.
+  - README conflicts: trustno1's text. d3cd650 and 033be27 applied cleanly.
+  - 4547204: two test shaders and the tables test updated to the merged signatures; the
+    switch-doc check (xtask) skips CLAUDE.md, SESSIONS.md, PROMPTS.md, PM_HANDOFF.md.
+  - PORT_* switches (VICTORY_PORT_CONSTANTS, _DESCRIPTORS, _CBV, _GUARD, _JOURNAL): off unless
+    set, as in avatarmanz. Nothing new added by this session.
+- Audit, rule #1 (before building): `cargo xtask policy` passes. avatarmanz 2de99801 adds no
+  logs, images, captures, IDs or machine paths; no file removed. The bcpack tables binary is
+  the one already in main. It adds two more of the title's shader names and two mentions of
+  the title's name, of the same kind as the base already has (Session 3). Safety: no new
+  build.rs, no new crate; new process launches are tests or the `warm` workers; the title's
+  network stays blocked.
+- Tests (on 4547204 = this tree's code):
+  - fmt: FAIL, 3,179 diffs (Session 3: 2,788; avatarmanz 2de99801 alone: 3,159). Not fixed.
+  - clippy: FAIL, 3 errors (Session 3: 38): `transmute` without annotations x2 in victory-loader descriptor_sites.rs, an unneeded `&mut` in victory-gpu watch.rs. Clippy stops at crates that fail, so further lints may be hidden. Not fixed.
+  - clippy all-features: FAIL, the same 3 errors.
+  - test: pass, 1,039 passed, 0 failed (Session 3: 927). The port-7 test flaky once earlier (below).
+  - policy: pass, 283 files.
+  - `cargo build --locked --profile diag -p victory --features diagnostics`: OK.
+- Shaders ahead of time (avatar build, its own cache folder via VICTORY_CACHE_DIR so nvidia's
+  stays as it was for G): 25,787 translated, 198 not translatable, 662 s with PORT_* off, 886 s
+  with them on (nvidia, Session 3: 25,776 / 209 / 558 s). Pipelines ahead of time: G's book
+  (83,559 title pipelines, 2,533 drawn with) copied to the avatar cache, `warm --used`: 2,533
+  made, 7 without a host pipeline, none ended its process; 429 s for H's variables, 17 s for
+  I's (the driver had most already).
+- Conditions: the game folder was MOVED from the HDD to the SSD just before G (the user's
+  choice: the HDD was at 100 % during scans); G, G2, H, H2, I all read it from the SSD. One boot
+  for all runs (G was its first launch; the user did not restart between runs after that).
+  Task Manager was open beside the game during G only. Page file: 16-32 GB on the SSD plus
+  system-managed 26 GB on the HDD; not changed (PM). Every run: `play-nvidia.ps1 -NoSmoothMotion`
+  (Series S, output 1920x1080, world at 960x540) plus VICTORY_NO_WATCHDOG=1, VICTORY_THIN=0,
+  VICTORY_PIPELINE_WAIT_MS=150, VICTORY_PIPELINE_WORKERS=4, VICTORY_PIPELINE_BOOK=1. From G2 on,
+  also sampled (read only): CPU of the Windows antivirus and of the indexer, physical disk
+  reads and busy time. Room window: 3 min from when the user said they entered (G2: from when
+  the picture settled; the user did not say and later went on to the next cutscene). The user
+  moved about in G2, H and H2 and stood still in I.
+- Measurements (first room, 3 min each; frame split = median of the layer's own frame lines):
+
+  | | G (nvidia, first launch) | G2 (nvidia) | H (avatar, first launch) | H2 (avatar) | I (avatar + 5 PORT_*) |
+  |---|---|---|---|---|---|
+  | mean fps | 0.86 | 7.2 | 0.63 | 2.0 | 2.9 |
+  | median ms/frame (p90) | 2,656 (6,925) | 113 (609) | 2,030 (9,727) | 441 (817) | 335 (444) |
+  | samples > 300 ms / > 1 s | 95 % / 71 % | 18 % / 3 % | 100 % / 81 % | 100 % / 6 % | 90 % / 1 % |
+  | median draws/frame | 5,143 | 4,558 | 5,833 | 5,095 | 4,625 |
+  | frame split: CPU preparing / GPU / copying back (ms) | 300-360 / 0-270 / 21-95 | 64 / ~0 / 32 | 460 / 0 / 32 | 76 / 0 / 23 | 58 / 0 / 26 |
+  | victory CPU, share of the machine | - | 36 % | 29 % | 13 % | 15 % |
+  | lowest / mean free RAM | 0.32 / 0.75 GB | 1.11 / 1.40 GB | 0.58 / 1.13 GB | 0.49 / 0.96 GB | 1.19 / 1.76 GB |
+  | peak commit, process / system | 19.4 / 36.4 GB | 19.1 / 37.0 GB | 23.1 / 41.3 GB | 21.8 / 39.7 GB | 20.0 / 38.1 GB |
+  | peak GPU memory | 5.9 GB | 5.6 GB | 8.4 GB | 8.1 GB | 6.8 GB |
+  | antivirus CPU mean / max | - | 0.1 / 3.5 % | 0.4 / 4.1 % | 0.3 / 3.1 % | 0.4 / 5.8 % |
+  | indexer CPU max | - | 0.3 % | 0.3 % | 0.3 % | 0.3 % |
+  | HDD (holds a page file) busy | - | 98 % | 100 % | 100 % | 77 % |
+  | crash | no (stopped by me) | no | no | no | no |
+
+  - G is set aside (PM): first launch after the move. G2, same build and command, is back at
+    Session 3's E (6.0 fps, 154 ms; split 75 / 42 / 31). G2 is the reference.
+  - H was a cold start for the avatar build: "no host pipeline library yet", 88 pipelines still
+    being made in the room (`warm` fills the driver's cache, not the layer's library). H2 is
+    the same run with the library H saved (208 MB; nvidia's is 438 MB). I ran third and loaded
+    232 MB; 3 of its frame lines over the whole run had pipelines being made.
+  - H2 and I: the layer's own parts of a frame add up to about 100 ms, the frame takes 330-450
+    ms, and the process uses about a third of the CPU G2 uses: it waits for something the frame
+    line does not count. More memory (H2: +2.7 GB process, +2.4 GB GPU over G2) on a PC that
+    already pages to an HDD is one candidate; a wait in avatarmanz's code is another. Not looked
+    into (one task per session).
+  - I vs H2: better (2.9 vs 2.0 fps, p90 444 vs 817 ms), but the user stood still in I. No crash.
+    The log has 1,301 warnings from the descriptor port (a view record in the title's heap it
+    could not match); none in H2.
+  - Picture (the user): in I, as usual. In H2 and several other runs (which ones not said), a
+    character's arms were drawn without textures, and while walking textures in the room
+    sometimes stretched wrongly. Cutscenes do not play right, at times not at all. Not tied to
+    one build by these runs.
+  - J (720p) not run: the PM's condition was "only if H/I go well"; both are far below G2.
+  - During G2's loading the HDD was busy 65 % with the game not reading from it, and at 98-100 %
+    in the room. Page file peaks since boot: 2.1 GB on the SSD, 4.2 GB on the HDD. Free space
+    on C: (read only, for the PM): 269 GB.
+- Recommended command: unchanged from Session 3, on branch nvidia (diag build): G2 is the best
+  measured. avatar-nvidia is not recommended for playing.
+- What did NOT work or was taken back out: a direct cherry-pick of the PORT_* commits (above).
+  `warm --used` does not fill the layer's host pipeline library, so the first launch of a build
+  on a new cache is still cold (H).
+- Open problems found (not fixed):
+  - avatar-nvidia: frames 3-4x slower than nvidia with most of the time outside what the frame
+    line counts; more process and GPU memory.
+  - The first launch after moving the game, or of a build on a new cache, is 7-10x slower in the
+    room than the second (G, H).
+  - The page file on the HDD is busy at 77-100 % during play.
+  - fmt fails on the merged base (3,159 diffs in avatarmanz alone); clippy, see above. The test
+    `watch::port7_tests::no_write_is_lost_with_port_7` failed once in a full run and passed 3 of
+    3 alone (flaky).
+  - The interface-plane switch `play-nvidia.ps1` sets has no effect on avatar-nvidia.
+- Questions for the user / PM: keep avatar-nvidia as a branch to study, or go back to nvidia
+  as the working base?
+- Suggested next task: on nvidia, the page file entirely on the SSD (the PM's next session),
+  then G2's run again, then J (720p) on nvidia.
+
+## Session 5 — nvidia remeasured: page file on the SSD, 720p, -Quality, texture staging (2026-11-27)
+- Branch / start commit / end commit: nvidia / 20537b5 (= origin/nvidia) / the commit that
+  adds this entry. Switched from avatar-nvidia (5649892) keeping the PM's PM_HANDOFF.md
+  byte for byte. avatar-nvidia and main not moved. Nothing pushed.
+- Task given: no code change; on nvidia's diag build with Session 3's recommended command and
+  VICTORY_PIPELINE_BOOK=1, measure in the first room: K = as is (vs Session 4's G2), L = K at
+  720p, M = the better + `-Quality`, N = the best + fxceless/victory-fork#1268's texture set.
+- What was done (files, switches added): no code changed. The Session 4 entry copied as it is
+  from avatar-nvidia 5649892 (SESSIONS.md now equals that commit's, plus this entry). The diag
+  build was rebuilt (target held avatar-nvidia's): same size as Session 3's, 14,238,720 bytes.
+  nvidia's own cache (shaders, 438 MB host pipeline library) was warm and untouched since G2.
+- Start state checked (read only): page file only on C: (SSD), 32,768-49,152 MB, in force
+  since the 00:14 boot; commit limit 47.9 GB (Session 4: 57.9). The user did not restart
+  between runs (one boot for K, L, M, N); about 15-17 GB committed before each launch.
+- What the texture set does (read in crates/victory-gpu/src/draw.rs before N):
+  `VICTORY_TEXTURE_STAGE_MB=512` = bytes of textures made per frame (default on this 12 GB card:
+  192 MB); `VICTORY_TEXTURE_STAGE_MS=50` = time a frame's texture pass may take (default 250
+  ms); `VICTORY_TEXTURE_CATCHUP=1` = the default already (with 1,024 or more due, both limits
+  x3). So N stages more bytes per frame but stalls a frame for much less time.
+- `-Quality` values (M), checked: `play-nvidia.ps1` sets VICTORY_RELAY=1, VICTORY_CARD_STEPS=0,
+  VICTORY_TEXTURE_NO_WAIT=0, and `-More` (our five switches) does not touch them. The log
+  confirms the relay stage: its relay line reads `exact=false` in M (stage 1) and `exact=true`
+  in G2, K, L, N (stage 2, VICTORY_RELAY=2; that line names "VICTORY_RELAY=1" in every run, it
+  is the line's fixed text). CARD_STEPS and TEXTURE_NO_WAIT have no log line: taken from the
+  script.
+- Tests (20537b5, this tree's code; same as Session 3):
+  - fmt: FAIL, 2,788 diffs (Session 3: 2,788).
+  - clippy: FAIL, 38 errors counted with `--keep-going` (Session 3: 38); a plain run stops at
+    the first failing crates and shows 5. clippy all-features: FAIL, the same 5 in a plain run.
+  - test: 927 passed, 0 failed (Session 3: 927).
+  - policy: pass (265 files).
+- Measurements (first room, 3 min from when the user said they entered; Series S profile,
+  output 1920x1080; frame split = median of the layer's own frame lines; "textures waiting" =
+  the layer's count at the first and last frame line of the window; sampled read only every
+  2 s like Session 4, with the antivirus, indexer and disks):
+
+  | | G2 (S4, page file on HDD+SSD) | K | L (720p) | M (-Quality) | N (K + textures) |
+  |---|---|---|---|---|---|
+  | mean fps | 7.2 | **7.6** | 5.9 | 6.0 | 7.3 |
+  | median ms/frame (p90) | 113 (609) | 131 (**160**) | 153 (404) | 160 (258) | 131 (260) |
+  | samples > 300 ms / > 1 s | 18 % / 3 % | **2 % / 0 %** | 11 % / 6 % | 6 % / 0 % | 6 % / 3 % |
+  | median draws/frame | 4,558 | 5,047 | 5,282 | 4,587 | 4,784 |
+  | split CPU preparing / GPU / copying back (ms) | 64 / ~0 / 32 | 76 / 0 / 35 | 89 / 1.5 / 38 | 61 / **85** / 27 | 75 / 0 / 33 |
+  | lowest / mean free RAM | 1.11 / 1.40 GB | 0.34 / 0.89 | 0.16 / 0.78 | 0.25 / 0.73 | 0.32 / 0.76 |
+  | peak commit, process / system (limit) | 19.1 / 37.0 (57.9) | 21.9 / 42.6 (47.9) | 22.9 / **44.3** | 21.3 / 42.6 | 21.8 / 42.3 |
+  | peak GPU memory | 5.6 GB | 7.7 | 8.3 | 7.3 | 7.6 |
+  | HDD busy / SSD busy | 98 % / 17 % | **0 %** / 62 % | 0 % / 89 % | 0 % / 71 % | 0 % / 65 % |
+  | textures waiting in the room, first -> last | 15,413 -> 1,653 | 16,127 -> 2,996 | 16,623 -> 3,794 | 13,591 -> 4,420 | 13,534 -> **1,539** |
+  | black loading screen | - | 40 s | 40 s | 49 s | 54 s |
+  | arrival cutscene: mean fps, median ms, > 1 s | - | 3.2, 465, 29 % | 3.2, 335, 4 % | skipped by the user | **4.2, 255, 0 %** |
+  | arrival cutscene: textures waiting, first -> last | - | 18,262 -> 16,429 (peak 21,897) | 17,487 -> 17,126 | - | 18,837 -> 14,238 |
+  | launch to room | > 8 min | about 3 min 20 | 2 min 40 | 2 min 30 | 2 min 40 |
+  | crash / freeze | no | no | no | no | no |
+
+  Antivirus 0.7-1.1 % mean, at most 8 %; indexer at most 1 %: not a factor. The system commit
+  came within 3.6 GB of the new 47.9 GB limit (L) but never reached it; no freeze was seen.
+- Reading the table:
+  - K vs G2: about the same mean fps, but long frames almost gone (p90 609 -> 160 ms, > 300 ms
+    18 % -> 2 %), the HDD idle, the room reached in a third of the time. Two things changed at
+    once (page file only on the SSD, and another boot with 2-3 GB more committed at start), so
+    the gain is not given to the page file alone. More memory used (process +2.8 GB, GPU +2 GB)
+    with the same build and settings: not explained.
+  - L (720p): -1.7 fps, more hitches, the highest memory. The user: clearly sharper than K.
+    Better to the eye but not kept for now (fps, memory); to try again once memory is settled.
+  - M (-Quality): -1.6 fps; the GPU part grows from 0 to 85 ms a frame (the submitting thread
+    waits for the card, as the script's comment says). Stretched bodies and clothes: REDUCED,
+    NOT GONE (the user); worse the more characters are on screen (a scene with many characters
+    in one room stretches most). A character's arms again drawn in the wrong colour. Kept
+    values: VICTORY_RELAY=1, VICTORY_CARD_STEPS=0, VICTORY_TEXTURE_NO_WAIT=0 (above). For
+    Session 6, which is to fix this in code.
+  - N's base: the PM's rule was M if it lost 1.5 fps or less against K, else K. M lost 1.58
+    (7.63 -> 6.05): K was taken, by a small margin.
+  - N vs K: in the room about the same (-0.35 fps, one run each; more hitches: > 300 ms 6 % vs
+    2 %, p90 260 vs 160), textures drain faster (1,539 left after 3 min vs 2,996). In the arrival
+    cutscene clearly smoother (4.2 vs 3.2 fps, no frame over 1 s vs 29 %). The cutscene started
+    on time (the user); textures of buildings and eyes in it still came late. In the room, the
+    user saw nothing arriving late.
+- Picture, the user (all runs at 540p unless said): blurry and grainy, textures messy (K); the
+  edge of a window visible through the user's character that should hide it (K); bodies and
+  clothes stretched (all; less with -Quality); a character's arms untextured or wrongly
+  coloured (M, and earlier in Session 4); textures stretching and the character's edges
+  merging with the background at times, mostly when the camera moves (N).
+- Recommended command (branch nvidia, diag build): K, unchanged from Session 3:
+  `.\scripts\play-nvidia.ps1 -Exe <title exe> -NoSmoothMotion -More @{VICTORY_NO_WATCHDOG='1';
+  VICTORY_THIN='0'; VICTORY_PIPELINE_WAIT_MS='150'; VICTORY_PIPELINE_WORKERS='4'}`
+  It has the most fps and the fewest long frames measured. What it gives up: a sharper picture
+  (720p: -1.7 fps), fewer stretched bodies (-Quality: -1.6 fps), smoother cutscenes and faster
+  texture arrival (N's set: -0.35 fps in the room, more hitches there). Add
+  `VICTORY_TEXTURE_STAGE_MB='512'; VICTORY_TEXTURE_STAGE_MS='50'` inside `-More` to prefer
+  cutscenes; one run each, the room difference is within what one run can tell.
+- What did NOT work or was taken back out: nothing taken out. M's arrival cutscene not
+  measured (skipped by the user).
+- Open problems found (not fixed):
+  - Stretched bodies and clothes, worse with many characters; -Quality only reduces it.
+  - A character's arms untextured or wrongly coloured; a window edge seen through the user's
+    character; character edges merging with the background when the camera moves.
+  - Arrival cutscene: 14,000-17,000 textures still waiting at its end in every run.
+  - The commit limit dropped from 57.9 to 47.9 GB with the new page file; L came within 3.6 GB.
+  - Same build and settings use about 2-3 GB more process and GPU memory than in Session 4.
+  - fmt and clippy fail on this base (above, as in Session 3).
+- Questions for the user / PM: whether to raise the page file's maximum (L's margin), and
+  whether to take N's texture set into the recommended command for smoother cutscenes.
+- Suggested next task: Session 6 as planned (the stretched bodies in code, starting from what
+  VICTORY_RELAY=1 / VICTORY_CARD_STEPS=0 change); then L (720p) again once memory is settled.

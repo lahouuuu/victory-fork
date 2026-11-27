@@ -1001,3 +1001,91 @@ CLAUDE.md, rule #1).
 - Questions for the user / PM: whether to take W's command as the one to play with.
 - Suggested next task: make the reflection stand-in run (or find which pass it should follow in
   this base), since it is what the white eyes and floors come from.
+
+## Session 11 — the long-play memory leak fix (trustno1's PR #58) on nvidia2; 20-minute runs X0, X1 (2026-11-27)
+- Branch / start commit / end commit: nvidia2 / 9f692dc (= origin/nvidia2 after the PM's push; at the
+  first check origin/nvidia2 was still f9e3b0d, reported) / 8e19745, a74d115, d6389d7, 05ae124 (the
+  fix) + the commit that adds this entry. Nothing pushed.
+- Task given: bring in the fix of foxhound v0.2.0-pre.3's "memory leak in long play" (the layer kept
+  a new copy of views the title had only filled with different leftover bytes), then measure 20
+  minutes of play before (X0) and after (X1).
+- Where the fix was taken from: trustno1 already had it, after ca9c75c: PR #58 (merge 502f54c, 11:45
+  -0800 on 2026-11-27), "placed views ignore padding words (views leak, confetti on faces)". The PM
+  chose trustno1's commits over foxhound's (closer to our base). Picked with `git cherry-pick -x`, no
+  conflict, nothing else of trustno1's (not the "MFG Unlocker" downloaded at start, nor the other
+  commits after ca9c75c):
+  - 4eead67 -> 8e19745: placed views copy only the named fields of the resource description; its
+    padding (words 1 and 13) is zero, so the same view is no longer a new shape each time (from
+    JMAN730/project-flamingo b1e0cd1d, per its message).
+  - 89fd936 -> a74d115: table entries of views no resource releases go in a queue, oldest freed past
+    VICTORY_OWNERLESS_VIEWS (default 1,048,576; 0 keeps all). ON BY DEFAULT, unlike our rule for new
+    switches: it is the core of the fix asked for; noted, not changed.
+  - 144aca0 -> d6389d7: the view description's unused words (per dimension) are zero too.
+  - 8bff6c2 -> 05ae124 (test only, the 4th commit of that PR, taken with the user's yes): our test
+    `descriptor::tests::views_at_new_addresses_add_no_entries` expected the padding words kept and
+    failed every time without it.
+  Their messages say the shape table filled after about half an hour of play, after which every
+  placed view became a kept entry (34.9 million, 16.7 GB after 70 minutes on Series S).
+- Audit, rule #1 and safety: only crates/victory-gpu/src/descriptor.rs and resource.rs change; no URL,
+  path, identifier, long hex, process launch, file access or library load added. Policy passes.
+- Tests (05ae124; Session 10: fmt 3,462, clippy 42, 1,057 passed + 2 known failures):
+  - fmt: FAIL, 3,471 diffs: the 9 more are all in the picked code (descriptor.rs, resource.rs).
+  - clippy: FAIL, 42 (`--keep-going`); all-features 40. Same.
+  - test: 1,060 passed, the same 2 known failures, 46 ignored. (Before 8bff6c2 the descriptor test
+    above failed, and `watch::tests::kernel_reads_into_guarded_blocks_after_opening` failed once in a
+    full run and passed alone: flaky.)
+  - policy: pass. Release build: OK. 9f692dc's release build kept outside the repository for X0.
+- Measurements: Session 9's recommended command (`-SeriesS -Dlss off`, VICTORY_THIN=0,
+  VICTORY_NO_WATCHDOG=1, release, its own cache folder), Series S, 1280x720 scene; the same boot
+  (restarted before X0; X1 not restarted, 13.3 / 13.4 GB committed at launch); sampled every 2 s,
+  folded into minutes from when the user was in play. X0: the first room, the room with many
+  characters, the rest of the prologue, then the next mission (from minute 12). X1: the game
+  started at its checkpoint, the next mission directly (a boat, then a farm in marshes with much
+  vegetation from about minute 8): the places differ after minute 12 only partly.
+
+```
+  min | private GB X0 / X1 (each # = 0.25 GB over 20 GB)            | ms/frame median X0 / X1
+    1 | X0 21.31 #####          X1 20.33 #              |  114 /   90
+    2 | X0 21.30 #####          X1 20.27 #              |  107 /   92
+    3 | X0 21.68 #######        X1 20.46 ##             |  102 /   93
+    4 | X0 21.58 ######         X1 20.46 ##             |   93 /   92
+    5 | X0 21.55 ######         X1 20.42 ##             |   78 /   97
+    6 | X0 22.53 ##########     X1 20.48 ##             |  167 /  100
+    7 | X0 23.18 #############  X1 20.64 ###            |  165 /  102
+    8 | X0 23.34 #############  X1 21.01 ####           |  125 /  117
+    9 | X0 21.94 ########       X1 20.83 ###            |  104 /  116
+   10 | X0 23.10 ############   X1 21.20 #####          |  147 /  121
+   11 | X0 22.87 ###########    X1 21.05 ####           |  172 /  117
+   12 | X0 22.45 ##########     X1 21.13 #####          |   92 /  117
+   13 | X0 22.50 ##########     X1 21.24 #####          |  100 /  117
+   14 | X0 22.59 ##########     X1 21.29 #####          |   96 /  107
+   15 | X0 22.51 ##########     X1 21.61 ######         |   96 /  125
+   16 | X0 22.60 ##########     X1 21.71 #######        |   95 /  121
+   17 | X0 22.46 ##########     X1 21.71 #######        |   94 /  118
+   18 | X0 22.47 ##########     X1 21.71 #######        |   95 /  130
+   19 | X0 22.55 ##########     X1 21.60 ######         |  100 /  113
+   20 | X0 22.91 ############   X1 21.75 #######        |   95 /  128
+```
+
+  | | X0 (before) | X1 (after) |
+  |---|---|---|
+  | private memory, minute 1 -> 20 | 21.31 -> 22.91 GB (+1.6) | 20.33 -> 21.75 GB (+1.4) |
+  | system commit, minute 1 -> 20 (limit 63.9) | 39.86 -> 41.57 GB | 38.91 -> 40.18 GB |
+  | lowest free RAM | 0.00 GB (minutes 6, 8) | 0.04 GB |
+  | peak GPU memory | 9.37 GB | 8.58 GB |
+  | median ms/frame, minutes 13-20 | 94-100 | 107-130 (the vegetation) |
+  | crash | no | no |
+
+- Conclusion: neither run shows a leak in 20 minutes: memory rises 1.4-1.6 GB over the first
+  minutes and then holds (X0 22.5-22.9 GB from minute 12, X1 21.6-21.75 GB from minute 15); frame
+  times do not grow minute after minute (X1's slower minutes are the marsh's 6,500-7,500 draws a
+  frame against about 4,000 on the boat). So the fix could not be shown at work here: by its own
+  commit messages the leak starts once the shape table is full, after about half an hour of play;
+  20 minutes are too short to see it. X1 holds about 1 GB less memory than X0 throughout, but the
+  places differ. Not proven either way.
+- What did NOT work or was taken back out: nothing taken out.
+- Open problems found (not fixed): a run of 40 minutes or more is needed to see the leak and the fix;
+  VICTORY_OWNERLESS_VIEWS is on by default; fmt +9 from the picked code; the flaky watch test.
+- Questions for the user / PM: whether to run a 45-minute X0/X1 pair to see the leak.
+- Suggested next task: that longer pair (same place, the game loaded at the same checkpoint for
+  both).

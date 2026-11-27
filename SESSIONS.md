@@ -834,3 +834,67 @@ CLAUDE.md, rule #1).
   user's to change), since nvidia2 has BAR-based options.
 - Suggested next task: a second run of S0 and S1 to confirm the gap; then S1 with the newer
   trustno1 commits (d12eb1b) if the PM wants them.
+
+## Session 9 — VICTORY_NO_WATCHDOG ported to nvidia2; S1 confirmed (T1, T2) (2026-11-27)
+- Branch / start commit / end commit: nvidia2 (now the working branch, PM decision) / 0268984
+  (= origin/nvidia2) / a94ad08 (the port) + the commit that adds this entry. Nothing pushed.
+- Task given: put the title-watchdog switch of branch nvidia back into nvidia2 (same name, off by
+  default, applied only to the build its hash names), then two runs of Session 8's S1 with it.
+- What was done (files, switches added):
+  - Looked for an equivalent first: none in nvidia2. The offsets are nowhere in its tree; the
+    "watchdog" in crates/victory-loader/src/threads.rs is the layer's own, at process exit.
+  - New `crates/victory-loader/src/hooks.rs` (watchdog only; nvidia's render-scale hooks not
+    ported), `mod hooks` in lib.rs, the call in windows.rs right after the executable is
+    mapped and before any title code runs (the executable only, not the DLLs).
+  - `VICTORY_NO_WATCHDOG=1` (off by default; only "1" turns it on, where nvidia took any value):
+    if the original executable's BLAKE3 begins with the 1.0.2.1 build's, the two places where the
+    title's watchdog writes to address 0 are patched, each only if its bytes are exactly the
+    expected ones (else "hook skipped" in the log). Another build: a log line saying nothing was
+    patched. The log says "hook applied" for each and "title watchdog hooks (VICTORY_NO_WATCHDOG)
+    applied=N". Per-build offsets and short byte signatures under our names only (rule #1),
+    the same as nvidia's. Credit in the commit: our nvidia branch (trustno1 033be27), from
+    vitutu1/victory-perf, a port from ZigZagBoi1/ScarlettPort (GPL-3.0-or-later).
+  - Four synthetic tests (bytes of our own): the patches apply where their bytes are and only
+    once, other bytes are left untouched, only the known build hash passes, the switch reads
+    only "1".
+- Tests (a94ad08 against Session 8's 0268984):
+  - fmt: FAIL, 3,363 diffs (Session 8: 3,363; none in the files of this change).
+  - clippy: FAIL, 42 errors with `--keep-going` (Session 8: 42; none in hooks.rs; the loader's 4
+    are the old ones in write_sites.rs); all-features: 40.
+  - test: 1,031 passed (the 4 new ones included), the same 2 known failures in
+    victory-gpu's indirect tests, 46 ignored (`--no-fail-fast`).
+  - policy: pass (280 files). Release build: OK.
+- Measurements (S1's command + VICTORY_NO_WATCHDOG=1: nvidia2's scripts\play-nvidia.ps1, release
+  build, `-SeriesS -Dlss off`, VICTORY_THIN=0, its own cache folder; Series S, 1280x720 scene;
+  one boot, 16.2-17.0 GB committed at each launch; first room from when the user said, the
+  room with many characters from when the user said; the game takes the player on by itself,
+  so the windows are shorter than 3 min where noted). In both runs the log said
+  `applied=2`. No crash, no early end.
+
+  | | S1 (Session 8) | T1 | T2 |
+  |---|---|---|---|
+  | first room: mean fps, median ms (p90) | 7.3, 107 (631) | 8.0, 111 (595) [90 s] | 9.6, 100 (131) [74 s] |
+  | first room, samples > 300 ms | 28 % | 16 % | 0 % |
+  | many characters: mean fps, median ms (p90) | 11.5, 92 (106) | 13.0, 74 (96) [127 s] | 10.6, 86 (203) [174 s] |
+  | many characters, samples > 300 ms | 2 % | 0 % | 5 % |
+  | mean fps over both | 9.4 | 10.9 | 10.3 |
+  | split CPU / GPU / copy back, many characters (ms) | 63 / 2 / 27 | 57 / 3 / 25 | 63 / 2 / 26 |
+  | lowest free RAM; peak commit system | 0.24; 42.9 GB | 0.42; 42.9 | 0.00; 44.4 |
+  | peak GPU memory | 9.1 GB | 9.3 | 9.1 |
+
+  S1 is confirmed: 9.4 to 10.9 fps over both places in three runs. The switch itself does not
+  change frame times (it only removes a deliberate fault); T1/T2's small gain over S1 is more
+  likely the fuller cache and shorter windows.
+- Picture (the user): the arrival cutscene still badly drawn, with big white flashes, "as if it
+  starts before the game is ready" (T1); loaded a little faster in T2 but still ugly, and in play
+  "not at the level of the console versions"; eyes still too white under some angles.
+- Recommended command (branch nvidia2, release build, its own cache folder, a warm-up launch
+  first): `.\scripts\play-nvidia.ps1 -Exe <title exe> -SeriesS -Dlss off -More @{VICTORY_THIN='0';
+  VICTORY_NO_WATCHDOG='1'}`
+- What did NOT work or was taken back out: nothing.
+- Open problems found (not fixed): cutscenes drawn before they are ready (white flashes, black
+  screens); eyes too white; free RAM still reaches 0 GB at times (T2); the 2 failing tests of
+  the base.
+- Questions for the user / PM: none open.
+- Suggested next task: the cutscenes (they start while pipelines and textures are still being
+  made), or the newer trustno1 commits (up to d12eb1b) on nvidia2.

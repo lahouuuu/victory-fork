@@ -507,3 +507,121 @@ CLAUDE.md, rule #1).
   whether to take N's texture set into the recommended command for smoother cutscenes.
 - Suggested next task: Session 6 as planned (the stretched bodies in code, starting from what
   VICTORY_RELAY=1 / VICTORY_CARD_STEPS=0 change); then L (720p) again once memory is settled.
+
+## Session 6 — stretched bodies: diagnosed with VICTORY_UPCOPY_CHECK, VICTORY_FETCH_CHECK measured; cause not found (2026-11-27)
+- Branch / start commit / end commit: nvidia / 5f4eb4b (= origin/nvidia) / the commit that
+  adds this entry. No code changed. Nothing pushed.
+- Task given: remove the stretched bodies and clothes at the least fps cost. PM decisions on
+  the way: an existing fix before new code; a diagnostic run first (VICTORY_UPCOPY_CHECK=1),
+  then P (base command) and Q (P + the switch the diagnostic names); Q2 (VICTORY_RELAY_COPY=0)
+  and new code only if Q fails. After Q the PM stopped the measurements (fps first): no Q2, no
+  new code.
+- Page file: the start check found the OLD setting (C: 32,768-49,152 MB, commit limit 47.9 GB),
+  and it was still so after a first restart (04:50). After the PM set it again and restarted
+  (04:56): C: only, 49,152-65,536 MB, 49,152 MB in use, commit limit 63.9 GB. Read only.
+  P and Q ran on that boot; the diagnostic runs (D, D2) on the old setting.
+- What is known of the cause, read in the code (crates/victory-gpu):
+  - The relay's second stage (`relay_exact`, host.rs) makes a read of title memory wait only
+    for flights that DECLARED writes there; the title's 174 MB heap is declared written as a
+    whole (host.rs, `fill_is_titles`), so CPU reads there do wait.
+  - Shaders that store through views they pick from the heap by a computed index (37 compute
+    programs; the skinning passes write so, card_steps.rs) write buffers nobody declared: the
+    result stays on the card and a later refresh of its 64 KiB sends older bytes over it
+    (picked.rs). `VICTORY_PICKED_WRITES=1|2` (off) declares buffers found written that way (2:
+    lands them too); off by default: hashing a 32 MB slice a frame plus the buffers found, and
+    what is found late stays on the card until the next declared write.
+  - With `VICTORY_RELAY_COPY=1` (set by play-nvidia.ps1) the fetch of card copies runs on the
+    copy queue beside later submissions, so a piece can come down half written; when its
+    compare does not flag it again the CPU side keeps those bytes until a refresh sends them
+    up (host/torn.rs). `VICTORY_FETCH_CHECK=1` (off) hashes every fetched piece and fetches
+    again a piece that is not what its flight ended with. Off by default "until a run has
+    shown how often a piece is caught and what the hashes cost" (3-4 ms for 96 MB, on the
+    threads that land). It does nothing without RELAY_COPY=1.
+  - `VICTORY_RELAY_COPY=0` (not run): fetches go over the drawing queue behind what was sent
+    meanwhile; its comment measures 48 ms of a 120 ms frame for the landing thread then.
+  - `VICTORY_UPCOPY_CHECK=1` (diagnostics): compares what goes up to card copies with what the
+    card holds, and at rest whole copies; each finding names why (never declared there, or
+    declared and last fetched N frames ago). Its own comment: not for timed runs.
+  - Searched for an existing fix: avatarmanz issue 13 and fxceless issue 89 (read on GitHub):
+    nobody reports it fully fixed; one tester reports `VICTORY_FETCH_CHECK=1` with RELAY=2
+    fixes it on Linux; the usual workaround is RELAY=1 CARD_STEPS=0 (Session 5's -Quality).
+- Diagnostic (base command + VICTORY_UPCOPY_CHECK=1, not timed; first room window estimated
+  from the picture settling, the room with many characters from when the user said):
+
+  | D2 | first room (110-220 s, est.) | corridor | room with many characters (180 s) |
+  |---|---|---|---|
+  | sends that put older values over the card's | 315 | 1,624 | 4,083 |
+  | words overwritten | 1.7 M | 8.6 M | 26.3 M |
+  | cause, of the 590 sends the log names | 100 % "declared; last fetched 0-1 frames ago" | same | same |
+  | cause "never declared / no shader declared" | 0 | 0 | 0 |
+
+  Most of them in one 25 MB buffer. At rest, copies whose card side differs held title memory
+  equal to the CPU side (the card had newer bytes). About 10x more in the room with many
+  characters than in the first room, as the user sees. So the diagnostic named
+  VICTORY_FETCH_CHECK (cause 2), not PICKED_WRITES.
+- Crashes (not seen in Sessions 3-5; both in the same code: a list's prelude, the copies of
+  depth textures, `Host::submit` host.rs:5605 / `prelude()`):
+  - D (first diagnostic launch, 04:28, about 140 s in, during the arrival cutscene):
+    unhandled exception 0xc0000005 in the NVIDIA driver's user-mode DLL (a read at 0x36),
+    called from `Host::submit` (frames named from our build's PDB). The title's own crash
+    reporter then tried to upload a report; the layer blocked the connection. D2, same
+    settings, cutscene skipped: no crash.
+  - P (first launch, about 129 s in, at the end of the arrival cutscene, before the user took
+    control): "host GPU failure: no host list for a state prelude", the device refused a
+    command list with E_OUTOFMEMORY (0x8007000E); free RAM 0.07 GB, commit 39.5 / 63.9 GB (not
+    at the limit), the process's private memory up 1.6 GB in 3 s. P2, same settings: no crash;
+    Q: no crash.
+  - Also in Windows' log at the same time, unrelated: the motherboard's RGB lighting service
+    crashing (its own DLL).
+- Tests (5f4eb4b, same code as Session 5):
+  - fmt: FAIL, 2,788 diffs (Session 5: 2,788).
+  - clippy: FAIL, 38 errors (Session 5: 38); clippy all-features: FAIL, 36. This time every
+    failing crate was reported in one run (4 crates).
+  - test: 927 passed, 0 failed (Session 5: 927).
+  - policy: pass (265 files).
+- Measurements (base command = `-NoSmoothMotion` + VICTORY_NO_WATCHDOG=1, THIN=0,
+  PIPELINE_WAIT_MS=150, PIPELINE_WORKERS=4, TEXTURE_STAGE_MB=512, TEXTURE_STAGE_MS=50; Series
+  S, world at 540p; same boot, 14.1-14.5 GB committed at each launch, no restart between runs;
+  first room 3 min from when the user said (Q: 2.5 min, the user went on), then the room with
+  many characters (P 3 min; Q about 75 s, the window was closed before the end)):
+
+  | | P first room | P many characters | Q first room | Q many characters |
+  |---|---|---|---|---|
+  | mean fps | 7.3 | 8.9 | 8.0 | 8.3 |
+  | median ms/frame (p90) | 133 (186) | 123 (142) | 125 (154) | 117 (133) |
+  | samples > 300 ms | 2 % | 0 % | 0 % | 0 % |
+  | median draws/frame | 4,824 | 3,752 | 4,707 | 4,782 |
+  | split CPU preparing / GPU / copying back (ms) | 72 / 0 / 38 | 67 / 0 / 35 | 72 / 0 / 37 | 72 / 0 / 39 |
+  | lowest free RAM; peak commit, process / system | 0.38; 21.9 / 41.2 GB | 0.21; 22.7 / 41.8 | 0.27; 21.9 / 41.3 | 0.45; 22.0 / 41.4 |
+  | peak GPU memory | 7.7 GB | 8.4 | 7.4 | 7.5 |
+  | stretching (the user) | seen from afar on arrival, calm once inside | a little: less often and on fewer objects than before | the same as P | the same as P |
+  | crash | P: once (above), P2 none | none | none | none |
+
+  P and Q weighted over both places: 8.09 and 8.09 fps. Q's fetch check: about 690 pieces
+  checked a frame, 0.3-0.8 of them caught half written and fetched again.
+- Conclusion: VICTORY_FETCH_CHECK does what it says (it catches real half-written pieces) and
+  costs nothing measurable here (one run each), but the stretching stays as it was. The
+  stretching is NOT mainly caused by pieces fetched half written; the remaining cause is not
+  known; set aside (PM: fps first). The user also saw, in the room with many characters, a
+  guard's arms in a wrong colour (light arms on a dark-skinned character): a wrong or stale
+  texture rather than stretching.
+- Recommended command (branch nvidia, diag build): the base command plus FETCH_CHECK (kept: it
+  costs nothing and catches real wrong pieces):
+  `.\scripts\play-nvidia.ps1 -Exe <title exe> -NoSmoothMotion -More @{VICTORY_NO_WATCHDOG='1';
+  VICTORY_THIN='0'; VICTORY_PIPELINE_WAIT_MS='150'; VICTORY_PIPELINE_WORKERS='4';
+  VICTORY_TEXTURE_STAGE_MB='512'; VICTORY_TEXTURE_STAGE_MS='50'; VICTORY_FETCH_CHECK='1'}`
+- What did NOT work or was taken back out: FETCH_CHECK against the stretching (above). Q2 and
+  new code not tried (PM decision).
+- Open problems found (not fixed):
+  - Stretched bodies: cause unknown after this session (not half-written fetches; the
+    diagnostic found no undeclared writes in the sends it names, but names at most 4 sends per
+    buffer per line).
+  - Two crashes in a list's prelude (depth texture copies), one in the NVIDIA driver, one
+    E_OUTOFMEMORY with free RAM near 0; each once in two launches; cause not looked into.
+  - Free RAM falls to 0.1-0.4 GB in every run (16 GB for 22 GB of process memory).
+- Questions for the user / PM: none open.
+- Suggested next task: fps first: try the settings of brothernog/rota that our base already
+  reads (VICTORY_CARD_ALL and VICTORY_MEMORY_CARD_MB in shadow.rs, VICTORY_MEMORY_MAP in
+  copystat.rs, VICTORY_DYNAMIC_SLOTS in descriptor/host.rs; the values are in that fork's
+  apps/victory/src/tuned.rs, not in our tree). Later: the newer nvidia/main (9d6300f: DLSS,
+  frame generation) audited and measured; the stretching and the prelude crashes.

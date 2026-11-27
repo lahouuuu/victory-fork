@@ -708,3 +708,129 @@ CLAUDE.md, rule #1).
   does not exist in it).
 - Suggested next task: confirm R1 vs R0 with a second run each (one run each so far); then
   the release build with R1's settings again, the first room watched from the same entry.
+
+## Session 8 — trial of trustno1's new base (48ad7859, "foxhound") on branch nvidia2 (2026-11-27)
+- Branch / start commit / end commit: nvidia2 (new, local, from nvidia 1657259) / 5a41a8b
+  ("trustno1 48ad7859, squashed": the tree of 48ad7859 in one commit, our CLAUDE.md, SESSIONS.md,
+  PROMPTS.md from nvidia on top, PM_HANDOFF.md as received) / the commit that adds this entry.
+  None of trustno1's commits is in our history. nvidia (1657259), main (040e82e) and
+  avatar-nvidia (5649892) not moved. Nothing pushed.
+- Start state: nvidia = origin/nvidia = 1657259; page file C: only, 49,152-65,536 MB.
+  trustno1-coder/VIctory-NVIDIA had 29 commits newer than 48ad7859 (up to d12eb1b, 05:40 the same
+  day): not taken (PM). 744 commits from our base 033be27 to 48ad7859; 117 files changed against
+  nvidia's tree.
+- Task given: try that version beside nvidia and compare it with our best command: audit first,
+  checks, diag build, shaders ahead of time and a warm-up, then S0 (nvidia, Session 7's R1), S1
+  (their launcher, Series S, no DLSS), S2 (S1 + R1's settings), and from a PM addition S3 (their
+  default profile: Series X 2560x1440, no DLSS) and S4 (S3 with DLSS Quality, NVIDIA's files
+  allowed through their Get-NVIDIA-DLSS.cmd only).
+- Audit, rule #1 (before any build): `cargo xtask policy` passes (275 files of theirs; 279 with
+  ours). No logs, pictures, captures, dumps or executables in the tree; no personal identifiers
+  (the save code's user id is the same made-up constant); machine paths only as examples
+  (`D:\Games\MyDump`). No file removed. To note for the PM: more of the title's names than
+  before (58 distinct shader names against 39 in nvidia; the title's executable name in 8 files,
+  0 in nvidia), of the same kind as earlier bases. Their policy.rs now allows `.py` (for
+  scripts/faultbook.py). Removed by them: crates/victory-loader/src/hooks.rs (with it
+  VICTORY_NO_WATCHDOG, VICTORY_RENDER_SCALE, VICTORY_OWN_UPSCALER), scripts/rt_off_hashes.txt,
+  the play-S-*/play-X-* launchers, and our 4 .md files (put back).
+- Audit, safety: no new build.rs and no new crate in Cargo.lock. The title's network stays
+  blocked (net.rs unchanged: only loopback). Get-NVIDIA-DLSS.cmd and `victory get-dlss` (and a
+  question at `victory play` start, only when stdin is a terminal) run scripts/get-nvidia-sdks.ps1,
+  which downloads only from github.com/NVIDIA-RTX/Streamline releases (v2.14.16), takes 8 DLLs and
+  their licences out of the zip into nvidia-sdk\ in the repository (git-ignored), no registry,
+  no install, no admin. Play-VIctory.cmd names a prebuilt `victory-3d-rtx-pareto-residency.exe`
+  that is not in the tree. Their launcher writes victory-settings.txt in the repository (F1
+  menu, git-ignored) and logs to %LOCALAPPDATA%\victory\logs. With the PM's permission
+  Get-NVIDIA-DLSS.cmd was run once before S4 (41 s, about 70 MB); the 8 DLLs carry valid
+  signatures of NVIDIA Corporation; `git status` shows nothing new (nvidia-sdk/ ignored).
+- Their launcher: scripts/play-nvidia.ps1 only calls scripts/play-foxhound.ps1. Defaults: release
+  build, Series X with a native 2560x1440 scene, DLSS Quality when NVIDIA's files are there, no
+  frame cap (VICTORY_FRAME_INTERVAL_US=1000), VICTORY_THIN=1, RELAY=2, RELAY_COPY=1, CARD_STEPS=2,
+  CARD_BUFFERS_MIN_KB=64, TEXTURE_STAGE_MS=16, TEXTURE_CATCHUP=0, VICTORY_AMBIENT_SPECULAR=1 (a
+  reflection estimate), VICTORY_EARLY_DEPTH=1, VICTORY_PIPELINE_BOOK=1 and others. `-SeriesS` is
+  a 1280x720 scene (no render scale switch any more); no `-NoSmoothMotion` and no `-Resolution`.
+  The "BAR windows under 24 GB of RAM" setting was not found in 48ad7859: what depends on the
+  PC's memory is residency.rs (`limited_host_ram`: 32 GiB or less, true here), which makes the
+  caches leaner; VICTORY_SEND_BAR and VICTORY_WC_BAR exist, off, not set by the script.
+- Resizable BAR (read only, `nvidia-smi -q -d MEMORY`): BAR1 total 256 MiB: OFF on this card.
+- Tests (nvidia2 = 48ad7859's code, nothing fixed):
+  - fmt: FAIL, 3,363 diffs (nvidia: 2,788).
+  - clippy: FAIL, 42 errors counted with `--keep-going` (nvidia: 38); a plain run stops at the
+    first failing crate (1 error shown).
+  - test: 1,027 passed, 2 FAILED, 46 ignored (`--no-fail-fast`; nvidia: 927 passed, 0 failed):
+    `indirect::tests::host_list_budget_starts_empty_at_each_submission` and
+    `indirect::tests::warp_batch_charges_every_execution` (left 0, right 134,217,728), failing
+    every time, not flaky.
+  - policy: pass. diag build (`--profile diag --features diagnostics`) and release build: OK.
+- Shaders ahead of time (release build, its own new cache folder, with the switches their script
+  sets for S1, read from the script itself): 25,760 translated, 225 not translatable (198
+  containers without a program it takes, 22 wave64 programs with no wave32 lowering, 5 others),
+  263 s. Warm-up launch W (S1's settings, played to the room with many characters, not timed):
+  black screen during the arrival cutscene; heads drawn as eyes and teeth only in the first
+  room, then drawn after a while (late textures); about 12-13 fps at the end.
+- nvidia's diag build kept outside the repo for S0 (copy of 1657259's), nvidia's warm cache
+  untouched (nvidia2 used its own).
+- Measurements (one boot, 15.7-17.7 GB committed at each launch; first room 3 min from when the
+  room was drawn after the user said so, then the room with many characters 3 min; "mean fps"
+  is the mean of the window caption's fps, "median ms" the median of its ms/frame: the mean is
+  pulled up by a few very fast stretches, so both are given):
+
+  | | S0 nvidia, R1 | S1 nvidia2, Series S 720p | S2 = S1 + R1's settings | S3 nvidia2, Series X 1440p | S4 = S3 + DLSS Quality |
+  |---|---|---|---|---|---|
+  | first room: mean fps, median ms (p90) | 7.4, 123 (215) | 7.3, 107 (631) | 5.9, 221 (238) | 5.8, 207 (271) | 6.7, 181 (274) [86 s] |
+  | first room, samples > 300 ms | 5 % | 28 % | 0 % | 8 % | 3 % |
+  | many characters: mean fps, median ms (p90) | 9.6, 111 (131) | **11.5, 92 (106)** | 17.1, 88 (389) | 8.6, 107 (4,411) [a later place, see below] | 10.0, 98 (624) |
+  | many characters, samples > 300 ms / > 1 s | 0 % / 0 % | 2 % / 0 % | 16 % / 2 % | 33 % / 24 % | 16 % / 5 % |
+  | mean fps over both | 8.5 | **9.4** | 11.5 | 7.1 | 8.9 |
+  | split CPU / GPU / copy back, many characters (ms) | 61 / 0 / 32 | 63 / 2 / 27 | 70 / 2 / 26 | 67 / 13 / 15 | 57 / 0 / 14 |
+  | lowest free RAM | 0.05 GB | 0.24 | **0.00** | **0.00** | **0.00** |
+  | peak process private / system commit | 23.0 / 44.6 GB | 22.2 / 42.9 | 24.0 / 44.5 | 27.1 / 50.3 | 27.4 / 50.7 |
+  | peak GPU memory | 8.3 GB | 9.1 | 9.3 | 10.9 | 10.6 |
+  | textures waiting at the end, many characters | 4,239 | 2,874 | 8,179 | 16,985 (rising) | 18,578 (rising) |
+  | crash | no | no | no | no | no |
+
+  R1's settings in S2 (those nvidia2 reads and its script does not set): VICTORY_PIPELINE_WAIT_MS=
+  150, PIPELINE_WORKERS=4, TEXTURE_STAGE_MB=512, FETCH_CHECK=1, CARD_ALL=1, MEMORY_CARD_MB=1024,
+  MEMORY_MAP=0 (diag only; S1-S4 ran the release build). S3/S4 also had those, VICTORY_THIN=0 and
+  VICTORY_NO_WATCHDOG=1 (no longer read by nvidia2). No crash in the 8 launches of nvidia2 without
+  the watchdog switch. S3: the user went past the room with many characters; its second window
+  is the next place (toward a desk), as S2's window ran into it too. S4: a first launch ran
+  unattended (the game went on by itself through the cutscenes) and was not used; in the one
+  used, the user left the first room after 86 s.
+- Picture (the user):
+  - S0: fine.
+  - S1: everything drawn in play, textures sharper (posters on the walls readable), NO stretching
+    seen in the room with many characters, some shadow faults, eyes too white under some angles
+    (pupils hidden as by a white layer), one character's glasses now right but her face's colour
+    changed; cutscenes badly drawn; frame times took a while to settle in the first room.
+  - S2: walls of a corridor black seen from inside it (fine from outside: a lighting fault), a
+    character earlier drawn wrong now right, the same white eyes; black screen in the arrival
+    cutscene (skipped).
+  - S3: purple and blue textures in the first room, then drawn right; a guard's arms glitching
+    again. S4: sharp; eyes too white under some angles; one character's head still wrong.
+- Reading: nvidia2 in Series S (S1) is faster than nvidia (S0) in the room with many characters
+  (median 92 vs 111 ms, about +20 %; mean 11.5 vs 9.6 fps) and about level in the first room
+  (median 107 vs 123 ms, but with many more long frames there: p90 631 vs 215). Over both, mean
+  9.4 vs 8.5 fps. One run each. It renders at 720p where nvidia renders at 540p, and the user
+  saw no stretching. R1's settings do not help nvidia2 (S2: the first room twice as slow by the
+  median, free RAM at 0, a new lighting fault). The Series X 1440p profile (S3, S4) runs out of
+  memory on this PC (16 GB): free RAM 0, a quarter of S3's frames over a second, textures piling
+  up; DLSS (S4) does not change that.
+- Recommended command: S1, on branch nvidia2 (release build, its own cache folder):
+  `.\scripts\play-nvidia.ps1 -Exe <title exe> -SeriesS -Dlss off -More @{VICTORY_THIN='0'}`
+  (cache folder: VICTORY_CACHE_DIR to a folder of its own; a warm-up launch first). What it costs:
+  black or badly drawn cutscenes, eyes too white under some angles, more long frames while the
+  first room settles; and the base has 2 failing tests and no watchdog switch. If the PM wants
+  no new fault, the alternative is S0 (nvidia, Session 7's command, 8.5 fps).
+- What did NOT work or was taken back out: R1's settings on nvidia2 (S2). The Series X 1440p
+  profile, with or without DLSS, on 16 GB. A first S4 launch (unattended).
+- Open problems found (not fixed):
+  - nvidia2: two unit tests fail; VICTORY_NO_WATCHDOG gone (the title's watchdog could end a run
+    again in long stalls; none seen); cutscenes black or badly drawn; eyes too white.
+  - RAM: every nvidia2 run but S1 reached 0 GB free.
+  - Resizable BAR is off on this PC (BAR1 256 MiB).
+- Questions for the user / PM: take S1 (faster, sharper, no stretching seen, worse cutscenes) or
+  stay on S0 (no new fault)? Whether to turn on Resizable BAR in the BIOS (a system setting, the
+  user's to change), since nvidia2 has BAR-based options.
+- Suggested next task: a second run of S0 and S1 to confirm the gap; then S1 with the newer
+  trustno1 commits (d12eb1b) if the PM wants them.

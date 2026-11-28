@@ -1175,3 +1175,81 @@ CLAUDE.md, rule #1).
 - Questions for the user / PM: whether to confirm the two winners with three runs each.
 - Suggested next task: the CPU preparing itself (about 55-65 ms of a frame): where it goes, from a
   diag build's frame split, rather than more switches.
+
+## Session 13 — where the CPU preparing goes, from the logs of Sessions 9-12 (no game launched) (2026-11-28)
+- Branch / start commit / end commit: nvidia2 / 3759fb5 (= origin/nvidia2) / the commit that adds this
+  entry. No code changed, the game not launched. Nothing pushed. (Session 12's three-runs-each
+  confirmation was proposed but not run: the PM replaced it with this session.)
+- Task given: from the existing run logs, split the ~55-65 ms of CPU preparing per frame, explain
+  the three largest items, and propose one change for Session 14.
+- Sources: the layer's own 5-second lines in the logs of Session 12's runs (Y0a, Y0b, Y1, Y3-Y6,
+  Yfinal; Y2 left out, its switch made it slower) and of Sessions 9-10 (T1, T2, V1, W), each taken
+  over its measured windows (medians). All are nvidia2 release builds, Series S, 1280x720 scene, the
+  same command. The logs stay outside the repository. Two lines are used:
+  - the frame line: "N preparing: copies N ms ...; N on the GPU; N copying back" (preparing = the
+    submitting thread's time preparing submissions, its waits for the card taken out);
+  - the submitting thread's line: everything that thread does per frame, waits included.
+- Frame line, median of the 8 Session 12 runs: 86.8 ms a frame = 58.2 preparing (of it 27.0 the
+  copies/refreshes) + 4.8 waiting for the card + 26.0 copying back (the landing threads' fetch and
+  merge). Sessions 9-10 runs: preparing 59-69 ms, copying back 26-28 ms (more draws there).
+- The submitting thread per frame (median of the 8 runs): 72.8 ms in its submissions + 7.0 ms after
+  sending = 78 ms of work:
+
+  | item (the log's words) | ms a frame | % of 78 ms |
+  |---|---|---|
+  | lists' steps: refreshes of host copies (buffers and textures, on several threads) | 26.1 | 33 % |
+  | copies in the card's memory (what changed goes up; compares planned) | 10.9 | 14 % |
+  | planning the steps done on the card | 8.8 | 11 % |
+  | lists' steps: the rest (copies and fills, one-at-a-time refreshes before shader writes) | 7.8 | 10 % |
+  | asking the write watch (which pages the title wrote) | 7.0 | 9 % |
+  | after the sending (flight noted, landed lists reset and given back) | 7.0 | 9 % |
+  | the title's bytes put in under flights' writes | 4.0 | 5 % |
+  | the heaps' records (begun + waited for at the end) | 2.5 | 3 % |
+  | sending the lists | 2.4 | 3 % |
+  | waiting for flights | 1.8 | 2 % |
+
+  Counts in the same window (Y0b): 6,133 refreshes a frame in 45 flushes, 5,256 of them found to
+  copy nothing; textures refreshed: 18.4 ms a frame summed over all threads ("reading, hashing and
+  detiling"); copies in the card's memory: 3,664 copies (1.9 GB), 44.1 MB sent up a frame in 44,293
+  ranges (about 1 KB each), 6,960 pieces compared on the card, 662 fetched; steps done on the card:
+  6,783 fills a frame planned.
+- What these logs cannot split: inside the refreshes, reading vs hashing vs detiling, and buffers
+  vs textures on the thread's own clock (only the all-thread texture sum is given); the recording of
+  the title's lists, which happens on the title's and the translating threads, not on the submitting
+  thread (where the ~13 ms per 1,000 draws is spent is not in these lines); the title's own CPU work;
+  the card's own working time (its clock line counts time with work queued, ~99 %, waits included);
+  inside the landing threads' 26 ms beyond "merging what was fetched 8.3 ms" and "read-backs and
+  lists 5.4 ms" (Y0b).
+- The three largest items, read in the code (crates/victory-gpu/src/host.rs, shadow.rs,
+  host/card_steps.rs):
+  1. Refreshes (26 ms). Before the card runs the title's lists, every range of title memory those
+     lists read is brought up to date in our copy of it (`Batch::flush`): the write watch says which
+     pages the title wrote, each touched copy is checked (`nothing_new`) and updated, textures are
+     read again, hashed and converted from the console's tiled layout. Spread on several threads,
+     but the thread waits for the slowest. Costly here because there are thousands of small ranges a
+     frame (6,133), most with nothing new, and texture detiling is byte work on an 8-core 2019 CPU
+     with DDR4 shared with the title.
+  2. Copies in the card's memory (11 ms). Buffers kept on the card (`card_before`): the bytes that
+     changed on our side since the last submission are sent up, and a compare of the ranges the
+     shaders may write is planned to run after the lists. 44,293 separate ranges a frame, about 1 KB
+     each: the cost is per range (bookkeeping, a copy command each), not per byte.
+  3. Planning the steps done on the card (8.8 ms). `card_steps::plan`: about 6,800 fills of constant
+     buffers a frame are done on the card behind earlier flights instead of waiting for them; for
+     each submission the plan works out which fills depend on which (ranges read and written,
+     joined in rounds) so their order stays right. Pure bookkeeping on the submitting thread,
+     before anything is sent.
+- Proposal for Session 14 (one change): speed up `card_steps::plan` for the common case. Most fills
+  read constants no other taken step writes; a fast path that sorts the submission's written ranges
+  once and admits a fill with one binary search, falling back to today's rounds only when a fill
+  meets a write, would leave the order unchanged. Estimated gain: 5-7 of the 8.8 ms on the
+  submitting thread, about 6-8 % of an 87 ms frame, i.e. +0.6 to +0.9 fps (not proven). Risk:
+  medium, the order of steps done on the card (a mistake shows as wrong constants: flicker, wrong
+  colours, a device error); card_steps.rs has synthetic tests of `plan` to extend, behind a new
+  switch, off by default. Work: 3-4 h. Measure: one launch at Session 12's checkpoint (2 min still),
+  the switch on, compared with the 8 Session 12 runs (planning 8.8 ms, preparing 58.2 ms, 11.1 fps),
+  reading the planning item of the split line first (it must drop) and the fps second.
+  Larger but harder: the 44,293 small sends a frame (join neighbouring ranges before sending; more
+  bytes, fewer commands) and the refreshes found to copy nothing (5,256 a frame).
+- Tests: no code changed; `cargo xtask policy`: pass (283 files).
+- Questions for the user / PM: whether Session 14 takes the planning fast path or the joining of the
+  small sends.

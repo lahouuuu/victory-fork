@@ -1372,3 +1372,74 @@ CLAUDE.md, rule #1).
   grew here, 9.5-10.3 ms a frame); or, for the ray-tracing preparing, one diag run that logs which
   compute passes write what only the left-out ray-tracing passes read, to build a safe
   VICTORY_LEAVE_OUT list from hashes.
+
+## Session 14 (addendum) — frame generation on this build, DLSS Quality, the repositories' news (2026-11-28)
+- Branch / start commit / end commit: nvidia2 / c1a7e9d / the commit that adds this addendum. No
+  code changed. Nothing pushed.
+- The frame-generation run of the entry above (Z2b + Session 12's frame-generation command, i.e.
+  `-Dlss off -FrameGen -FgType fsr`, VICTORY_THIN=1): it ran 2 minutes with no crash but FSR 3
+  frame generation stayed off. Since trustno1's df2daaf (in e7d8150) FSR 3 frame generation needs
+  DLSS for the upscaling (streamline.rs: without it the title stopped at the start on other PCs),
+  so Session 12's frame-generation command no longer turns it on. Measured anyway: 10.51 fps
+  rendered, nothing generated, 7.8 GB VRAM peak.
+- The PM's last tests (same method, Z2b's switches, `-Dlss quality`; DLSS files outside the
+  repository, git-ignored). The first DLSS + FSR 3 run was set aside: the user played (a boat
+  ride) during its window; it was run again standing still.
+
+  | run | rendered fps | shown fps | median ms (p90) | preparing / on the GPU / copying back (ms) | peak private / commit / VRAM (GB) |
+  |---|---|---|---|---|---|
+  | Z2b (`-Dlss off`, the title's upscaling) | 11.05 | | 89 (104) | 54.2 / 6.0 / 26.2 | 21.0 / 41.1 / 9.0 |
+  | ZD: Z2b + DLSS Quality | 13.14 | | 75 (87) | 48.5 / 0.2 / 15.1 | 21.3 / 41.7 / 9.0 |
+  | ZFGd: Z2b + DLSS Quality + FSR 3 2x (THIN=1) | 12.84 | 25.60 | 76 (92) | 36.1 / 25.0 / 12.2 | 20.6 / 41.0 / 7.7 |
+  | Session 12, Yfinal + FSR 3 2x (`-Dlss off`) | 10.16 | 20.59 | 98 (103) | | 20.9 / 40.4 / 7.8 |
+
+  DLSS Quality draws the scene at two thirds of the size and DLSS upscales it: fewer pixels to
+  refresh and copy back (the submitting thread's refreshes 17.2 ms a frame against 26.4 in Z2b,
+  in all 61.4 ms against 74.7; copying back 15 ms against 26). +2.1 fps rendered against Z2b, well
+  above the 0.65 fps run-to-run noise: by the PM's rule (no more than ~0.5 fps lost) DLSS Quality
+  goes in the recommended command. With FSR 3 2x on top: 12.8 rendered / 25.6 shown, against
+  Session 12's 10.2 / 20.6. No crash.
+- Picture (the user, DLSS runs): some objects and the scenes still take time to load (as before);
+  no remark yet on sharpness against the title's upscaling. The user thinks the late loading
+  comes from the RAM.
+- RAM (the samples of every Session 14 run, 2 minutes after 4 minutes of play): free RAM at its
+  lowest 0.25-0.48 GB, the process's private memory 20.5-21.3 GB, 40.5-41.7 GB committed of a
+  64 GB commit limit, on a PC with 16 GB of physical memory: the process alone holds more than the
+  PC has, so it is short of RAM from the first minutes and pages, which likely slows loading (not
+  measured: no paging counter is sampled). Within one 2-minute window this is not a slow
+  leak (Session 11's 20-minute runs measured that one); it is how much the layer holds. Not
+  looked into further here (one task per session).
+- Recommended commands (branch nvidia2, release build, its own cache folder; DLSS files in
+  nvidia-sdk\Streamline\bin\x64, outside git). ALLOCATOR_TRIM is left at the launcher's default
+  (on): Z2b's +0.45 is unproven and that switch is what keeps memory down, which the user asks
+  for; ZD and ZFGd were measured with it off.
+  Rendered fps: `.\scripts\play-nvidia.ps1 -Exe <title exe> -SeriesS -Dlss quality -More
+  @{VICTORY_THIN='0'; VICTORY_NO_WATCHDOG='1'; VICTORY_FAULT_UNLOCKED='1';
+  VICTORY_HELPER_PRIORITY='2'}`
+  With frame generation (AMD's DLLs outside the repository):
+  `$env:VICTORY_FIDELITYFX_DIR = "$env:LOCALAPPDATA\victory\fidelityfx"` then
+  `.\scripts\play-nvidia.ps1 -Exe <title exe> -SeriesS -Dlss quality -FrameGen -FgType fsr -More
+  @{VICTORY_THIN='1'; VICTORY_NO_WATCHDOG='1'; VICTORY_FAULT_UNLOCKED='1';
+  VICTORY_HELPER_PRIORITY='2'}`
+  (A DLSS choice saved in the F1 menu overrides `-Dlss`: play-foxhound.ps1 reads it first.)
+- The repositories' news (fetched at the end of the session, nothing taken):
+  - trustno1 (nvidia/main), 5 commits after e7d8150: mouse and keyboard controls (4715a42,
+    2a66ef1, f4608f0: a pad mapping with bindings in bindings.ini, an F1 item; from ItsMK1's
+    patches, GPL-3.0: the PM says compatible, to take at the next trustno1 update); two GitHub
+    workflows (spam and request posts closed), of no use here.
+  - foxhound: 0.2.0-pre.4 (card choice, long-session slowdown, memory) and 0.2.0-pre.5 (8 GB
+    cards, DLSS and frame generation on Series S, profiles), whole-release commits; what trustno1
+    already has of them is not checked.
+  - upstream (fxceless) main 368967f: VIctory-NVIDIA's tree at 959dcaf (78 commits older than our
+    e7d8150) with ray tracing on by default (VICTORY_BVH_BUILDER=1) and the water's own light
+    (VICTORY_WATER_LIGHT=1), about 15 fps on an RTX 4070 per its message; both switches are in our
+    tree, off.
+  - avatarmanz: the repository is gone or private (fetch: not found).
+- Tests: no code changed; `cargo xtask policy`: pass.
+- Questions for the user / PM: is the DLSS Quality picture sharper or different from the title's
+  upscaling? Take the RAM next (see below)?
+- Suggested next task: the RAM. Where the ~21 GB of private memory goes in the first minutes (the
+  layer's own copies of title memory, textures kept on the host, command allocators, the pipeline
+  book), from the layer's memory lines of these runs and one diag run; then the largest item cut
+  behind a switch, measured by free RAM, paging and the time objects take to appear. foxhound
+  pre.4's memory work is a place to look first.

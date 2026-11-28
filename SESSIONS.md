@@ -1443,3 +1443,16 @@ CLAUDE.md, rule #1).
   book), from the layer's memory lines of these runs and one diag run; then the largest item cut
   behind a switch, measured by free RAM, paging and the time objects take to appear. foxhound
   pre.4's memory work is a place to look first.
+
+## Session 14 (addendum 2) — the user's view of the picture with DLSS Quality (2026-11-28)
+- Branch / start commit / end commit: nvidia2 / a965a39 / the commit that adds these lines. No code
+  changed. Nothing pushed.
+- The user, DLSS Quality runs: the picture is otherwise correct. On some launches, not all,
+  textures of characters' bodies or clothes show wrong colours or a multicoloured glitch (like
+  the earlier texture glitches, Session 12). Which launches and whether DLSS plays a part is not
+  known: not reproduced or looked into here.
+- Open problem (not fixed): those colour glitches, on some launches only; a launch-to-launch
+  difference points to the order textures arrive in (late or reused texture slots), not to the
+  upscaling, but that is not checked. VICTORY_SLOT_EVICT (unused texture slots given back, on by
+  default since e7d8150) is one candidate to test with it off.
+- Tests: no code changed; `cargo xtask policy`: pass.

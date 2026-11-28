@@ -19,7 +19,7 @@
 | Your card | Frame generation | Limits |
 | --- | --- | --- |
 | GeForce RTX 40 and RTX 50 | **DLSS frame generation** | 2x on RTX 40; more than 2x (up to 6x) needs an RTX 50 |
-| GeForce RTX 20 and RTX 30 | **AMD FSR 3 frame generation** (DLSS frame generation needs an RTX 40 or later) | **2x at most**. DLSS upscaling still works on these cards, so the Series X profile is fine |
+| GeForce RTX 20 and RTX 30 | **AMD FSR 3 frame generation** | **2x at most** (LOCAL: this tree leaves out the third-party MFG Unlocker mod trustno1 integrates; refused by the project) |
 | Other cards (no DLSS) | **AMD FSR 3 frame generation** | **2x at most, Series S profile only** (F1 menu, CONSOLE): without DLSS the game's own upscaler, which FSR 3 needs, only takes the Series S sizes. Not tested here |
 
 - **At every start the game tells you** which one your card runs, and why
@@ -29,9 +29,14 @@
   DLSS, or FSR 3 (also on an RTX 40/50, if you prefer it). FRAME GENERATION
   switches it off or on.
 - FSR 3 needs AMD's FidelityFX DLLs (`amd_fidelityfx_loader_dx12.dll` and
-  `amd_fidelityfx_framegeneration_dx12.dll`, from AMD's FidelityFX SDK). They
-  are AMD's and not part of this program: put them in a `fidelityfx` folder
-  next to `victory.exe`, or name their folder with `VICTORY_FIDELITYFX_DIR`.
+  `amd_fidelityfx_framegeneration_dx12.dll`, about 30 MB). They are AMD's and
+  not part of this program. On a card without DLSS frame generation (or with
+  FSR 3 chosen in F1) the first start of `victory.exe` asks once whether to
+  download them from AMD's own GitHub (the FidelityFX SDK);
+  `victory.exe get-fsr` does it later, and `Get-AMD-FSR.cmd` does it for the
+  script launcher. Each file is checked against the copy this fork was tested
+  with, and only loaded with AMD's valid signature. A `fidelityfx` folder next
+  to `victory.exe`, or `VICTORY_FIDELITYFX_DIR`, works too.
 
 ## Quick start: how to run it
 
@@ -48,11 +53,32 @@
   generation files (about 70 MB) from NVIDIA's own GitHub. They are NVIDIA's
   and are not part of this program; say no and the game still runs, with its
   own upscaling and no frame generation.
-- Nothing is written into your game folder: settings, saves, caches, logs and
-  NVIDIA's files are kept under `%LOCALAPPDATA%\victory`.
+- Settings, saves, caches, logs and NVIDIA's and AMD's files are kept under
+  `%LOCALAPPDATA%\victory`. The one exception is on Windows 10. Its own Direct3D 12
+  stops at shader model 6.5, and the game's translated shaders need 6.6. Without
+  6.6 the game shows a black screen and closes within seconds. So the first start
+  there offers to fetch Microsoft's newer Direct3D 12 runtime (the D3D12 Agility
+  SDK, `D3D12Core.dll`, about 22 MB from nuget.org). It goes into a `D3D12`
+  folder beside `victory.exe`. `victory.exe get-d3d12` does the same by hand.
+  The file is checked against Microsoft's signature and the tested SHA-256.
+  Windows 11 keeps using its own runtime. A `D3D12` folder that is already
+  there, for example from a repack or another guide (1.618, 1.620), is used
+  at the version of its `D3D12Core.dll`. Before v2026.11.27.6 that version
+  had to be 1.614, or Windows refused Direct3D 12 with `0x887E0003` (the
+  fix in .4 and .5 did not take effect).
+- C: drive full? Set `VICTORY_HOME` to another folder, once, in a command
+  prompt: `setx VICTORY_HOME D:\victory`. Then start victory.exe from a new
+  window. Settings, saves, caches, logs and the downloads all go there
+  instead of `%LOCALAPPDATA%\victory`. To keep what you have, move that
+  folder's contents there first.
 - You need Windows 10 or 11, 32 GB of RAM or more, an SSD and an NVIDIA
   GeForce RTX card with a recent driver. This repository and its releases
   contain no game files.
+- **The first start of each new version restarts by itself once.** A new
+  `victory.exe` runs at about 14 fps on its first start, and normally from then
+  on. So the first start plays about 20 seconds, says so at the top of the
+  picture, and starts the game again. It doesn't happen again for that version
+  (a mark is kept in `%LOCALAPPDATA%\victory\warmed`).
 
 **In the game**
 
@@ -153,8 +179,8 @@ speed, in the picture and in simply being able to play it:
 
 - **DLSS in place of the title's upscaler**, with its model and mode to choose.
 - **DLSS frame generation with up to six frames shown for each one rendered**,
-  switched and changed while playing, without a restart (foxhound's is 2x, set
-  at the start). By Streamline's own count it shows exactly 2, 4 and 6.
+  switched and changed while playing, without a restart, once it was on at the
+  start or made ready with `-FrameGenReady` (foxhound's is 2x, set at the start). By Streamline's own count it shows exactly 2, 4 and 6.
 - **Why frame generation showed nothing on a full 12 GB card**, found and
   fixed: the card's memory is now shared out so that it has room.
 - **The frame rate at the top left of the picture**: frames rendered a second
@@ -292,7 +318,7 @@ fork has always had; its options:
 | `-Fps 60` | a frame rate cap (30 is the title's own) |
 | `-SeriesS` | the Series S profile: 1280x720 inside, faster, softer |
 | `-Res 1080to1440` / `4k` | scene at 1080p upscaled by the title / the stock 3840x2160 output |
-| `-NoFrameGenReady` | frame generation only with `-FrameGen` (it is otherwise made ready at every start, so the menu can switch it) |
+| `-FrameGenReady` | frame generation made ready but off, so the F1 menu can switch it while playing (costs frame rate: ready, frames go through Streamline's swap chain; without it, a change in F1 takes effect at the next start) |
 | `-FgType auto` / `dlss` / `fsr` | which frame generation (see the top of this page); FSR 3's DLLs from `VICTORY_FIDELITYFX_DIR`, else `amd-sdk\FidelityFX\bin` here |
 | `-Build diag` | the diagnostics build (slower; captures, timelines, recording time in the F3 panel) |
 | `-More @{VICTORY_X='1'}` | add or override any switch |
@@ -302,6 +328,10 @@ delete that file to go back to them. Full screen: start the game, then run
 `.\scripts\fullscreen.ps1` in another window. Logs go to
 `%LOCALAPPDATA%\victory\logs`, saves to `%LOCALAPPDATA%\victory\data`.
 
+If the menu works but loading a scene closes the game, see the
+[Windows memory troubleshooting guide](docs/windows-memory.md). It shows how
+to check memory on systems with 32 GB of RAM or GPUs with 8 GB of VRAM.
+
 ## How it works, and the findings
 
 - [docs/README-foxhound.md](docs/README-foxhound.md): foxhound's own README
@@ -309,6 +339,8 @@ delete that file to go back to them. Full screen: start the game, then run
 - [docs/architecture.md](docs/architecture.md): the layer's parts.
 - [docs/findings.md](docs/findings.md): measurements behind the choices.
 - [docs/dlss.md](docs/dlss.md): DLSS and Frame Generation.
+- [docs/linux-proton.md](docs/linux-proton.md): building on Linux and first
+  runs under Proton (experimental).
 - [docs/fork-ray-tracing.md](docs/fork-ray-tracing.md): the title's ray tracing
   and the light estimate.
 - [docs/asset-policy.md](docs/asset-policy.md): what may and may not be in this
@@ -331,6 +363,10 @@ A tree of other people's work with a little on top; the history is kept.
   and the others foxhound's README names.
 - Everyone who sent pull requests to this fork before the move; that work is
   in the history, on the branch that was `main` until then.
+- Testing save sharing (F1 > EXPORT SAVE / IMPORT SAVE) with their own saves, in
+  [discussion #520](https://github.com/trustno1-coder/VIctory-NVIDIA/discussions/520):
+  [DueTonight](https://github.com/DueTonight) and
+  [mikan123pro](https://github.com/mikan123pro).
 - NVIDIA Streamline, DLSS and Reflex are NVIDIA's; they are loaded at run time
   from a folder you supply.
 - Much of this fork's code was written with

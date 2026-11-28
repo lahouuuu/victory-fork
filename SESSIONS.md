@@ -1253,3 +1253,122 @@ CLAUDE.md, rule #1).
 - Tests: no code changed; `cargo xtask policy`: pass (283 files).
 - Questions for the user / PM: whether Session 14 takes the planning fast path or the joining of the
   small sends.
+
+## Session 14 — trustno1 update (e7d8150) on nvidia2, Dastano's settings, the ray-tracing preparing, measured (2026-11-28)
+- Branch / start commit / end commit: nvidia2 / 8a4b8ab (= origin/nvidia2) / the commit that adds this
+  entry (after 1a0ae68, the update). Only PM_HANDOFF.md was modified at start; committed as received.
+  Nothing pushed.
+- Task given: bring nvidia2 up to trustno1 (63b902fe at least) in one squashed commit, keeping
+  VICTORY_NO_WATCHDOG and the leak fix, leaving out disk-searching or self-downloading launchers and
+  MFG Unlocker; take foxhound's fixes from Dastano if trustno1 has not; see whether the ray-tracing
+  geometry preparing still runs while ray tracing is off and prepare a skip with what the base has;
+  checks, release build; measure Z1 / Z2 (if needed) / Z3 / frame generation as in Session 12.
+- What was done:
+  - 1a0ae68 "trustno1 ca9c75c..e7d8150, squashed; MFG Unlocker left out": trustno1's 73 commits
+    from ca9c75c to e7d8150 (its newest, 2026-11-28; 63b902fe among them) in one commit, none of
+    their commits in our history. Conflicts in crates/victory-gpu/src/descriptor.rs and resource.rs
+    with our Session 11 picks of the leak fix: all four (4eead67, 89fd936, 144aca0, 8bff6c2) are in
+    e7d8150, so its version of both files is taken. VICTORY_NO_WATCHDOG (crates/victory-loader/src/
+    hooks.rs, its call in windows.rs) kept; its 4 tests pass and the runs' logs show its 2 hooks
+    applied.
+  - Left out (PM decision, a third-party unofficial mod): the MFG Unlocker integration, i.e. its
+    fetch script, the start's offer, its loading at the start of `play`, the `victory get-mfg`
+    command, its F1 menu item and their tests, and its README section (the RTX 20/30 row now says
+    the mod is left out here). What remains: comments, an NVIDIA ABI field name, and the generic mod
+    loader in streamline.rs (now unused). Still left out from Session 10: the one-click launcher.
+  - Audit (rule #1 and safety) of what e7d8150 brings: downloads only on an explicit command or a
+    question at `victory play`'s start (AMD's FSR 3 DLLs from AMD's GitHub, the D3D12 Agility runtime
+    from Microsoft's NuGet; get-d3d12.ps1 not run, the PM's decision); our run path and the launch
+    scripts call neither. build.rs: linker exports and delay-load only. No new crates, binaries,
+    machine paths or personal identifiers. `cargo xtask policy`: pass. Found, not changed (for the
+    PM): save_share.rs (F1's save export/import, writes beside the game's executable on a manual
+    action) holds the title's own name for one of its save files as a string; and trustno1's code
+    carries three more of the title's shader names in comments/strings than before (tolerated by the
+    PM; none added by us).
+  - Dastano's foxhound fixes: already in our code through trustno1 (nothing to cherry-pick; foxhound
+    has only whole-release commits), but our launcher does not turn them on, so their two settings
+    (VICTORY_TEXSPK_PASS_MS=8, VICTORY_PASSES_HOT=1, foxhound PR #13) were measured as Z1d.
+  - Ray-tracing preparing (point 3): nothing builds a ray-tracing structure on nvidia2 (title memory
+    by address: 0 structure builds a frame, about 0.1 ms a frame of bookkeeping); the ray-tracing passes
+    that need one are already left out on purpose, 339-531 a frame (median 480) in Z1's window (the frame
+    line's "left out on purpose" count); the resolve pass is left out unless VICTORY_RT_RESOLVE=1;
+    the reflection stand-in still runs. What the logs cannot tell is which of the compute passes
+    that move or skin geometry feed only the left-out passes and which also feed the normal
+    picture: no per-pass time or reader is logged, and leaving out one that the picture needs
+    would lose characters or scenery. So no VICTORY_LEAVE_OUT list is proposed and Z3 was not run.
+  - Release build; the translator changed (crates/victory-shader, the shader cache), so the
+    shaders were translated ahead again in nvidia2's cache: 25,760 shaders, 225 do not translate
+    (as before).
+- Tests (1a0ae68): fmt FAIL 3,771 diffs (Session 13: 3,471; the rise is trustno1's ~10,000 new
+  lines, none in what we changed); clippy FAIL 2 lints, all-features 3 (Session 13: 42 / 40; all in
+  trustno1's code, and clippy stops at the first crate that fails, so the counts are not
+  comparable); test 1,129 passed, 0 failed, 49 ignored (Session 13: the 2 known failures, now
+  passing); policy pass (296 files).
+- Measurements: Session 12's method. Release build, `-SeriesS -Dlss off`, VICTORY_THIN=0,
+  VICTORY_NO_WATCHDOG=1, nvidia2's cache folder, the checkpoint the game loads at start (its
+  cutscene left to play), standing still; a script outside the repo: launch, the world's first
+  frames (over 1,000 draws), 240 s, 120 s measured, game closed. The launcher now also sets
+  VICTORY_SLOT_EVICT, VICTORY_ALLOCATOR_TRIM and VICTORY_BUDGET_PACK to 1 and no longer makes FSR 3
+  ready-but-off by itself (in Session 12 that readiness stayed off anyway: its DLLs were not found
+  without -FrameGen, so it does not change the comparison). Z1 = Session 12's recommended command.
+  Same boot, 14.5-15.3 GB committed at each launch; median draws 3,476-3,596 (Session 12:
+  3,437-3,574). Z2 was run because Z1 was under 11.1.
+
+  | run | switches | mean fps | median ms (p90) | preparing / on the GPU / copying back (ms) | planning on the card's steps (ms) | peak private / commit / VRAM (GB) |
+  |---|---|---|---|---|---|---|
+  | Z1 | Session 12's recommended | 10.60 | 92 (110) | 58.4 / 5.5 / 26.2 | 10.2 | 21.2 / 40.5 / 9.0 |
+  | Z1d | Z1 + TEXSPK_PASS_MS=8 + PASSES_HOT=1 | 10.47 | 94 (109) | 60.2 / 4.2 / 26.6 | 10.3 | 21.1 / 41.0 / 8.9 |
+  | Z2a | Z1 + SLOT_EVICT=0 | 10.73 | 93 (105) | 63.3 / 3.2 / 26.8 | 9.9 | 21.1 / 40.9 / 9.0 |
+  | Z2b | Z1 + ALLOCATOR_TRIM=0 | 11.05 | 89 (104) | 54.2 / 6.0 / 26.2 | 9.5 | 21.0 / 41.1 / 9.0 |
+  | Z2c | Z1 + BUDGET_PACK=0 | 10.64 | 91 (102) | 59.1 / 3.3 / 26.3 | 9.8 | 21.0 / 41.4 / 9.0 |
+  | Session 12 (8 runs) | | 11.1 (bases) | 86 | 58.2 / 4.8 / 26.0 | 8.8 | 20.7-21.1 / 40.0-40.6 / 8.1-8.5 |
+
+  The submitting thread per frame (median, ms; Session 12's 8 runs in brackets): in all 74.7-78.3
+  (72.8); refreshes 25.3-26.7 (26.1); copies in the card's memory 11.1-12.1 (10.9); planning the
+  steps done on the card 9.5-10.3 (8.8); asking the write watch 7.1-7.5 (7.0); after the sending
+  6.8-8.0 (7.0); putting the title's bytes under flights' writes 4.0-5.1 (4.0); sending 2.4-2.5
+  (2.4). No crash in any measured run.
+- Reading: every run of this build is 0.05-0.6 fps under Session 12's 11.1 and the frame is 3-6 ms
+  longer (89-94 ms against 86); the CPU preparing is the same (54-63 ms against 58.2) and so are
+  the refreshes; what grew is on the submitting thread, 2-5 ms in all, the planning of the card's
+  steps (+0.7 to +1.5 ms) and the copies in the card's memory (+0.2 to +1.2) most. The card's
+  memory peaks 0.5 GB higher (9.0 GB). All of this is within or at the edge of the 0.65 fps that two
+  identical Session 12 runs differed by: a loss of about 0.5 fps against Session 12 is likely but
+  NOT proven. Z1d (Dastano's settings): no gain here (-0.13). Z2: switching off one of the three new
+  memory defaults never made it slower; ALLOCATOR_TRIM=0 (Z2b) is +0.45 over Z1 (the PM's 0.3 rule
+  met, within the noise; unproven). That switch is what keeps a long play's private memory down
+  (command allocators otherwise keep the most a list ever recorded, about 2.3 GB upstream): over 2
+  minutes its peak private memory is the same, a long play was not measured.
+- Not run: Z3 (no skip exists, see above); the frame-generation run with the best settings: the
+  first one waited at the start's dialog for its whole time (the user away), and the second was
+  called off before it started (the user leaving). The first Z2b and Z2c also waited at the dialog
+  the whole time and were run again.
+- Picture: not asked yet (the user away); no new fault expected from switches that only change
+  memory reuse, not checked.
+- Recommended command (branch nvidia2, release build, its own cache folder), rendered fps:
+  unchanged, `.\scripts\play-nvidia.ps1 -Exe <title exe> -SeriesS -Dlss off -More
+  @{VICTORY_THIN='0'; VICTORY_NO_WATCHDOG='1'; VICTORY_FAULT_UNLOCKED='1';
+  VICTORY_HELPER_PRIORITY='2'}` (on this build it now carries the three memory defaults). Candidate,
+  to confirm before recommending: the same + `VICTORY_ALLOCATOR_TRIM='0'` (Z2b), only after a
+  20-minute run shows memory does not grow without it.
+  With frame generation (AMD's DLLs outside the repository), unchanged from Session 12 and not
+  measured on this build: `$env:VICTORY_FIDELITYFX_DIR = "$env:LOCALAPPDATA\victory\fidelityfx"`
+  then `.\scripts\play-nvidia.ps1 -Exe <title exe> -SeriesS -Dlss off -FrameGen -FgType fsr -More
+  @{VICTORY_THIN='1'; VICTORY_NO_WATCHDOG='1'; VICTORY_DLSS_MODE='quality';
+  VICTORY_FAULT_UNLOCKED='1'; VICTORY_HELPER_PRIORITY='2'}`
+- What did NOT work or was taken back out: MFG Unlocker (left out); Dastano's two settings (no gain
+  measured); no ray-tracing skip prepared.
+- Open problems found (not fixed): this build's frame is about 3-6 ms longer than Session 12's, on
+  the submitting thread (planning, copies in the card's memory); the run-to-run noise is still
+  larger than every difference measured; the first launch after the shaders were translated again
+  stayed about 9 minutes at the start screen before the world (the start's dialog, or the
+  pipelines being made: not told apart); save_share.rs's string and the shader names (above); the
+  launcher left out in Session 10 is named in Session 10's entry and 1a0ae68's message by its file
+  name, which carries the title's name (trustno1's file name; for the PM to judge).
+- Questions for the user / PM: does the picture change on this build (shadows, characters,
+  reflections)? Run the frame-generation test when the user is back? Confirm Z2b (three runs, and a
+  20-minute memory run) before it goes in the recommended command?
+- Suggested next task: Session 13's proposal, the planning fast path in `card_steps::plan` (it
+  grew here, 9.5-10.3 ms a frame); or, for the ray-tracing preparing, one diag run that logs which
+  compute passes write what only the left-out ray-tracing passes read, to build a safe
+  VICTORY_LEAVE_OUT list from hashes.

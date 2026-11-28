@@ -1089,3 +1089,89 @@ CLAUDE.md, rule #1).
 - Questions for the user / PM: whether to run a 45-minute X0/X1 pair to see the leak.
 - Suggested next task: that longer pair (same place, the game loaded at the same checkpoint for
   both).
+
+## Session 12 — fps: sweep of the CPU-side switches that are off by default in nvidia2 (2026-11-28)
+- Branch / start commit / end commit: nvidia2 / ef42499 (= origin/nvidia2) / the commit that adds this
+  entry. No code changed. Nothing pushed.
+- Task given: find which of 16 off-by-default switches (memory tracking, submitting thread) raise
+  rendered fps on this PC with no new visible fault; then one run of the winners with frame generation.
+- The 16 switches, read in the code (crates/victory-gpu, crates/victory-hle):
+  - Already on in our base command (play-nvidia.ps1 calls play-foxhound.ps1, which sets them), so not
+    tested: VICTORY_SYNC_IN_PLACE, VICTORY_HEAP_SYNC_AT_SUBMIT, VICTORY_HEAP_SYNC_FIRST,
+    VICTORY_SPANS_QUICK, VICTORY_SYNC_FINE, VICTORY_SOFT_VIEWS=copies, VICTORY_WC_NO_BACK,
+    VICTORY_PRELUDE_UPLOADS.
+  - Left out: VICTORY_PORT_CONSTANTS (renderer port #1, the title's constants heap used in place;
+    docs/README-foxhound.md: "on a 12 GB card the GPU then waits (slower overall)", this card's
+    size); VICTORY_FAST_CORES (asks for the fast class of cores; only acts on processors with two
+    kinds, this one has one).
+  - Tested (6):
+    - VICTORY_FAULT_UNLOCKED=1 (watch.rs): a write fault opens a guarded block without the guards'
+      lock (its comment: 252 of 281 ms in the fault handler were waits for that lock); the guards'
+      notes are settled by the next lock holder.
+    - VICTORY_GUARD_HOT=50 (watch.rs): a block written again within 50 ms of its last rest stays
+      open that long (about 330 guard faults a frame); copied at every refresh while it rests.
+    - VICTORY_LAZY_VIEWS=1 (xmem.rs): the title's page-mapping calls map a view only when something
+      touches it (365,000 calls in 4 minutes of streaming per its comment).
+    - VICTORY_MAP_RUNS=1 (xmem.rs): one view per run of consecutive pages instead of one per page;
+      a later change inside a run maps the rest again.
+    - VICTORY_INDIRECT_MERGE=1 (indirect/merge.rs): identical indirect executions in a row joined
+      (a `shortcut:`: what a binding reads is taken as the run's first found it).
+    - VICTORY_HELPER_PRIORITY=2 (cores.rs): the threads a frame waits for at the highest thread
+      priority. The +1 fps its comment measured (8.6 -> 9.6 on a 6-core) is `helpers_raised`, which
+      is on by default (helpers above normal); 1 would leave them so, so 2 was the test.
+- Method: release build, Session 9's recommended command (`-SeriesS -Dlss off`, VICTORY_THIN=0,
+  VICTORY_NO_WATCHDOG=1, its own cache folder) + one switch at a time; the checkpoint the game loads
+  at start (a cutscene at the load, left to play), standing still; each run unattended by a script
+  (outside the repo): launch, the world's first frames (over 1,000 draws), 240 s, then 120 s
+  measured, game closed. Same boot, 14.4-17.0 GB committed at each launch. The first frame of each
+  run's window was the same phase of the scene in every run (median draws 3,437-3,574). The game
+  shows a dialog at start that needs an OK; once it waited (the first Y3), which only delays.
+  The first Y3 had a browser open on the PC during its window: set aside and run again.
+
+  | run | switch | mean fps | median ms (p90) | CPU / GPU / copy back (ms) | peak private / commit | vs bases' mean 11.10 |
+  |---|---|---|---|---|---|---|
+  | Y0a | base | 10.77 | 89 (131) | 66 / 3 / 28 | 20.8 / 40.0 GB | |
+  | Y1 | FAULT_UNLOCKED=1 | 11.47 | 86 (104) | 59 / 2 / 26 | 20.8 / 40.2 | +0.37 |
+  | Y2 | GUARD_HOT=50 | 9.43 | 104 (130) | 76 / 0 / 31 | 20.9 / 42.2 | -1.67 |
+  | Y3 | LAZY_VIEWS=1 | 11.39 | 86 (104) | 58 / 8 / 26 | 20.9 / 40.5 | +0.29 |
+  | Y4 | MAP_RUNS=1 | 11.23 | 87 (112) | 63 / 5 / 26 | 21.1 / 40.6 | +0.13 |
+  | Y5 | INDIRECT_MERGE=1 | 11.37 | 86 (112) | 58 / 3 / 27 | 21.0 / 40.6 | +0.27 |
+  | Y6 | HELPER_PRIORITY=2 | 11.59 | 85 (105) | 52 / 6 / 25 | 20.8 / 40.3 | +0.49 |
+  | Y0b | base | 11.42 | 86 (107) | 55 / 5 / 26 | 20.7 / 40.2 | |
+  | Yfinal | FAULT_UNLOCKED=1 + HELPER_PRIORITY=2 | 11.49 | 86 (114) | 58 / 4 / 26 | 21.1 / 40.4 | +0.39 |
+  | Yfinal + FG | the same + FSR 3 2x (THIN=1, quality scale) | 10.16 rendered, 20.59 shown | 98 (103) | | 20.9 / 40.4 | |
+
+  No crash in any run. Peak GPU memory 8.1-8.5 GB (7.8 with frame generation).
+- Reading: the two bases differ by 0.65 fps (10.77 / 11.42): the noise of one 2-minute run here.
+  By the PM's rule (>= 0.3 over the bases' mean, no new visible fault) FAULT_UNLOCKED (+0.37) and
+  HELPER_PRIORITY=2 (+0.49) win; LAZY_VIEWS (+0.29) and INDIRECT_MERGE (+0.27) just miss; MAP_RUNS
+  does nothing measurable; GUARD_HOT is clearly worse (-1.67 fps, more CPU preparing). Together
+  (Yfinal) 11.49, which is the second base (11.42) within 0.1: the gains are within the noise and
+  NOT proven. With frame generation the rendered rate falls by about 1.3 fps (THIN=1 is needed)
+  and the shown rate is about twice it.
+- Picture (the user, Yfinal and Yfinal + FG): no new fault; "quite pretty from some angles" but not
+  the console picture; glasses and eyes reflect too much light; some textures still glitch (as a
+  guard's arms did); models load late; the sky shows through the player character's head at times
+  and small blocky jerks: also seen without frame generation, so faults of the layer, not of FSR 3
+  or of the switches. With frame generation: the caption reads about 12 rendered / 25 shown.
+- Also noted (the user): at each checkpoint load the player character stands still before and after
+  the cutscene while the scene is still loading (the console has it ready): a loading-speed problem
+  of the layer, not looked into.
+- Tests (ef42499, same code as Session 11): fmt FAIL 3,471 diffs (Session 11: 3,471); clippy FAIL 42,
+  all-features 40 (same); test 1,060 passed, the same 2 known failures, 46 ignored; policy pass.
+- Recommended command (branch nvidia2, release build, its own cache folder), rendered fps:
+  `.\scripts\play-nvidia.ps1 -Exe <title exe> -SeriesS -Dlss off -More @{VICTORY_THIN='0';
+  VICTORY_NO_WATCHDOG='1'; VICTORY_FAULT_UNLOCKED='1'; VICTORY_HELPER_PRIORITY='2'}`
+  (the two new switches by the PM's rule; their gain is within this sweep's noise).
+  With frame generation (AMD's DLLs outside the repository):
+  `$env:VICTORY_FIDELITYFX_DIR = "$env:LOCALAPPDATA\victory\fidelityfx"` then
+  `.\scripts\play-nvidia.ps1 -Exe <title exe> -SeriesS -Dlss off -FrameGen -FgType fsr -More
+  @{VICTORY_THIN='1'; VICTORY_NO_WATCHDOG='1'; VICTORY_DLSS_MODE='quality';
+  VICTORY_FAULT_UNLOCKED='1'; VICTORY_HELPER_PRIORITY='2'}`
+- What did NOT work or was taken back out: VICTORY_GUARD_HOT (slower); the first Y3 (browser open).
+- Open problems found (not fixed): the run-to-run noise (0.65 fps) is larger than every gain but
+  GUARD_HOT's loss: deciding between these switches needs longer or repeated runs; characters and
+  scenery still load late; the sky through the player character's head; the reflection stand-in.
+- Questions for the user / PM: whether to confirm the two winners with three runs each.
+- Suggested next task: the CPU preparing itself (about 55-65 ms of a frame): where it goes, from a
+  diag build's frame split, rather than more switches.
